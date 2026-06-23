@@ -1,0 +1,246 @@
+"""WorldBuildSubGraph — structured world setting generation with real AI."""
+from typing import Literal
+from langgraph.graph import StateGraph, END
+from app.graphs.state import NovelState
+from app.services.ai_service import create_ai_service
+from app.agents.base_agent import BaseAgent
+from app.config import settings
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+WORLD_BUILD_SYSTEM = """你是一位资深的世界观架构师，精通各类小说的世界观设计。
+
+请根据用户的小说设定，按以下维度生成世界观内容。以JSON格式输出，每个字段用中文描述（300-500字）：
+
+```json
+{
+  "time_period": "时代背景（历史时期、时间跨度、关键历史事件）",
+  "geography": "地理版图（地形地貌、重要地点、气候环境）",
+  "power_system": "力量体系（修炼/魔法/科技等力量等级和规则）",
+  "factions": "势力格局（主要势力、组织关系、权力结构）",
+  "culture": "文化风俗（语言、节日、风俗、社会规范）",
+  "rules": "世界规则（物理法则、魔法限制、禁忌、特殊设定）"
+}
+```
+
+要求：
+1. 各维度之间保持内部一致性和逻辑自洽
+2. 内容需契合小说类型和主题
+3. 提供足够的深度让后续创作有据可依
+4. 避免陈词滥调，追求新颖独特的设定"""
+
+
+async def generate_time_period(state: NovelState) -> dict:
+    """Generate the time period and historical background."""
+    ai = _get_ai_service(state)
+    genre = state.get("genre", "玄幻")
+    title = state.get("title", "")
+    description = state.get("description", "")
+    existing = state.get("world_setting", {})
+
+    prompt = f"""小说标题：{title}
+类型：{genre}
+简介：{description}
+
+请生成这部小说的「时代背景」维度设定。要求300-500字，内容详实具体。只输出纯文本，不要JSON格式。"""
+
+    try:
+        result = await ai.generate(WORLD_BUILD_SYSTEM, prompt)
+        world = existing.copy()
+        world["time_period"] = result.strip()
+        return {"world_setting": world, "current_phase": "time_period_generated"}
+    except Exception as e:
+        logger.error("generate_time_period failed: %s", e)
+        return {"current_phase": "time_period_generated", "error": str(e)}
+
+
+async def generate_geography(state: NovelState) -> dict:
+    """Generate the geography and map layout."""
+    ai = _get_ai_service(state)
+    genre = state.get("genre", "玄幻")
+    title = state.get("title", "")
+    description = state.get("description", "")
+    world = state.get("world_setting", {})
+    time_period = world.get("time_period", "")
+
+    prompt = f"""小说标题：{title}
+类型：{genre}
+简介：{description}
+已生成的「时代背景」：{time_period[:300]}
+
+请根据以上信息生成「地理版图」维度设定。要求300-500字，内容详实具体。只输出纯文本，不要JSON格式。"""
+
+    try:
+        result = await ai.generate(WORLD_BUILD_SYSTEM, prompt)
+        world["geography"] = result.strip()
+        return {"world_setting": world, "current_phase": "geography_generated"}
+    except Exception as e:
+        logger.error("generate_geography failed: %s", e)
+        return {"current_phase": "geography_generated", "error": str(e)}
+
+
+async def generate_power_system(state: NovelState) -> dict:
+    """Generate the power/magic/cultivation system."""
+    ai = _get_ai_service(state)
+    genre = state.get("genre", "玄幻")
+    title = state.get("title", "")
+    description = state.get("description", "")
+    world = state.get("world_setting", {})
+
+    prompt = f"""小说标题：{title}
+类型：{genre}
+简介：{description}
+「时代背景」：{world.get('time_period', '')[:200]}
+「地理版图」：{world.get('geography', '')[:200]}
+
+请根据以上信息生成「力量体系」维度设定。要求300-500字，详细描述力量等级、修炼/升级方式、关键能力等。
+只输出纯文本，不要JSON格式。"""
+
+    try:
+        result = await ai.generate(WORLD_BUILD_SYSTEM, prompt)
+        world["power_system"] = result.strip()
+        return {"world_setting": world, "current_phase": "power_system_generated"}
+    except Exception as e:
+        logger.error("generate_power_system failed: %s", e)
+        return {"current_phase": "power_system_generated", "error": str(e)}
+
+
+async def generate_factions(state: NovelState) -> dict:
+    """Generate factions, organizations, and power dynamics."""
+    ai = _get_ai_service(state)
+    genre = state.get("genre", "玄幻")
+    title = state.get("title", "")
+    description = state.get("description", "")
+    world = state.get("world_setting", {})
+
+    prompt = f"""小说标题：{title}
+类型：{genre}
+简介：{description}
+「时代背景」：{world.get('time_period', '')[:150]}
+「力量体系」：{world.get('power_system', '')[:200]}
+
+请根据以上信息生成「势力格局」维度设定。描述3-5个主要势力/组织及其关系。
+要求300-500字。只输出纯文本，不要JSON格式。"""
+
+    try:
+        result = await ai.generate(WORLD_BUILD_SYSTEM, prompt)
+        world["factions"] = result.strip()
+        return {"world_setting": world, "current_phase": "factions_generated"}
+    except Exception as e:
+        logger.error("generate_factions failed: %s", e)
+        return {"current_phase": "factions_generated", "error": str(e)}
+
+
+async def generate_culture(state: NovelState) -> dict:
+    """Generate culture, customs, and social norms."""
+    ai = _get_ai_service(state)
+    genre = state.get("genre", "玄幻")
+    title = state.get("title", "")
+    description = state.get("description", "")
+    world = state.get("world_setting", {})
+
+    prompt = f"""小说标题：{title}
+类型：{genre}
+简介：{description}
+「势力格局」：{world.get('factions', '')[:200]}
+
+请根据以上信息生成「文化风俗」维度设定。包括社会规范、节日、语言特色、习俗等。
+要求300-500字。只输出纯文本，不要JSON格式。"""
+
+    try:
+        result = await ai.generate(WORLD_BUILD_SYSTEM, prompt)
+        world["culture"] = result.strip()
+        return {"world_setting": world, "current_phase": "culture_generated"}
+    except Exception as e:
+        logger.error("generate_culture failed: %s", e)
+        return {"current_phase": "culture_generated", "error": str(e)}
+
+
+async def check_consistency(state: NovelState) -> dict:
+    """Check the world setting for internal contradictions using AI."""
+    ai = _get_ai_service(state)
+    world = state.get("world_setting", {})
+
+    if not world:
+        return {"current_phase": "consistency_checked"}
+
+    prompt = f"""请检查以下世界观设定是否存在内部矛盾或不一致之处：
+
+{json.dumps(world, ensure_ascii=False, indent=2)}
+
+请以JSON格式输出：
+```json
+{{
+  "has_conflicts": true/false,
+  "conflicts": ["矛盾描述1", "矛盾描述2"],
+  "suggestions": ["改进建议1", "改进建议2"]
+}}
+```"""
+
+    try:
+        result = await ai.generate_json(
+            system_prompt="你是一位严格的世界观审查员，善于发现设定中的逻辑矛盾。",
+            user_prompt=prompt,
+            max_retries=3,
+        )
+        world["consistency_check"] = result
+        return {"world_setting": world, "current_phase": "consistency_checked"}
+    except Exception as e:
+        logger.error("consistency check failed: %s", e)
+        return {"current_phase": "consistency_checked", "error": str(e)}
+
+
+def route_after_check(state: NovelState) -> Literal["human_review", "done"]:
+    """Route based on whether the world setting passes consistency checks."""
+    world = state.get("world_setting", {})
+    if world.get("consistency_check", {}).get("has_conflicts"):
+        return "human_review"
+    return "done"
+
+
+def _get_ai_service(state: NovelState, **overrides):
+    """Get an AI service instance from state generation config."""
+    config = state.get("generation_config", {})
+    return create_ai_service(
+        provider=overrides.pop("provider", config.get("provider", "openai")),
+        api_key=overrides.pop("api_key", config.get("api_key", None)),
+        base_url=overrides.pop("base_url", config.get("base_url", None)),
+        model=overrides.pop("model", config.get("model", settings.default_ai_model)),
+        temperature=overrides.pop("temperature", config.get("temperature", 0.7)),
+        max_tokens=overrides.pop("max_tokens", config.get("max_tokens", 32000)),
+        **overrides,
+    )
+
+
+def create_world_build_subgraph():
+    """Create the WorldBuild subgraph.
+
+    Generates world setting dimensions sequentially:
+        time_period → geography → power_system → factions → culture
+        → consistency_check → [human_review if conflicts, else done]
+    """
+    builder = StateGraph(NovelState)
+
+    builder.add_node("generate_time_period", generate_time_period)
+    builder.add_node("generate_geography", generate_geography)
+    builder.add_node("generate_power_system", generate_power_system)
+    builder.add_node("generate_factions", generate_factions)
+    builder.add_node("generate_culture", generate_culture)
+    builder.add_node("check_consistency", check_consistency)
+
+    builder.set_entry_point("generate_time_period")
+    builder.add_edge("generate_time_period", "generate_geography")
+    builder.add_edge("generate_geography", "generate_power_system")
+    builder.add_edge("generate_power_system", "generate_factions")
+    builder.add_edge("generate_factions", "generate_culture")
+    builder.add_edge("generate_culture", "check_consistency")
+
+    builder.add_conditional_edges(
+        "check_consistency",
+        route_after_check,
+        {"human_review": END, "done": END}
+    )
+
+    return builder.compile()
