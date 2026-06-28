@@ -1,8 +1,7 @@
-"""MCP Service — DB-persisted service layer for Model Context Protocol integration.
+"""MCP Service — DB-persisted service layer wrapping MCPClientFacade.
 
-MCP server configs are persisted to the mcp_plugins table, so they survive
-service restarts. On startup, all enabled plugins are loaded from DB and
-registered with the runtime manager.
+On startup, loads all enabled plugins from DB and registers them with
+the facade. Provides CRUD operations that sync DB + runtime state.
 """
 import json
 import logging
@@ -10,84 +9,92 @@ from typing import Optional
 from sqlalchemy import select
 from app.database import async_session_factory
 from app.models.mcp_plugin import MCPPlugin
-from app.mcp.server_manager import MCPServerManager, MCPServerConfig, MCPTool
+from app.mcp.facade import MCPClientFacade, mcp_client, MCPError
 
 logger = logging.getLogger(__name__)
 
 
 class MCPService:
-    """Service-layer wrapper around MCPServerManager with DB persistence."""
+    """Service-layer wrapper around MCPClientFacade with DB persistence."""
 
-    def __init__(self, manager: Optional[MCPServerManager] = None):
-        self._manager = manager or MCPServerManager()
-        self._tool_cache: dict[str, list[MCPTool]] = {}
+    def __init__(self, facade: Optional[MCPClientFacade] = None):
+        self._facade = facade or mcp_client
         self._loaded = False
 
     @property
-    def manager(self) -> MCPServerManager:
-        return self._manager
+    def facade(self) -> MCPClientFacade:
+        return self._facade
 
     # ── Startup ─────────────────────────────────────────────────────────
 
     async def load_from_db(self):
-        """Load all saved MCP plugin configs from DB on startup."""
+        """Load all enabled MCP plugin configs from DB on startup."""
         if self._loaded:
             return
         async with async_session_factory() as session:
-            result = await session.execute(select(MCPPlugin))
-            for row in result.scalars().all():
+            result = await session.execute(
+                select(MCPPlugin).where(MCPPlugin.enabled == True)
+            )
+            rows = result.scalars().all()
+            for row in rows:
                 cfg = json.loads(row.config) if row.config else {}
-                config = MCPServerConfig(
-                    id=row.id,
-                    name=row.name,
-                    description=row.description or "",
-                    transport=row.transport,
-                    url=row.url,
-                    enabled=row.enabled,
-                    config=cfg,
-                )
-                await self._manager.register_server(config)
+                try:
+                    await self._facade.register(
+                        server_id=row.id,
+                        plugin_name=row.plugin_name,
+                        url=row.url,
+                        transport=row.transport,
+                        headers=cfg.get("headers"),
+                    )
+                except Exception as e:
+                    logger.warning("Failed to register MCP plugin %s on startup: %s", row.plugin_name, e)
             self._loaded = True
-        servers = await self._manager.get_servers()
-        logger.info("Loaded %d MCP plugins from DB", len(servers))
+        stats = self._facade.get_session_stats()
+        logger.info("Loaded %d MCP plugins from DB", stats["total"])
 
     # ── Server management ──────────────────────────────────────────────
 
-    async def register_server(self, config: MCPServerConfig) -> bool:
-        """Register a new MCP server and persist to DB (upsert if ID exists)."""
+    async def register_server(self, server_id: str, plugin_name: str,
+                              url: str, transport: str = "streamable_http",
+                              description: str = "", config: dict = None,
+                              enabled: bool = True) -> bool:
+        """Register a new MCP server and persist to DB."""
         try:
+            # Persist to DB
             async with async_session_factory() as session:
                 result = await session.execute(
-                    select(MCPPlugin).where(MCPPlugin.id == config.id))
+                    select(MCPPlugin).where(MCPPlugin.id == server_id))
                 existing = result.scalar_one_or_none()
                 if existing:
-                    existing.name = config.name
-                    existing.description = config.description
-                    existing.transport = config.transport
-                    existing.url = config.url
-                    existing.enabled = config.enabled
-                    existing.config = json.dumps(config.config, ensure_ascii=False)
+                    existing.plugin_name = plugin_name
+                    existing.description = description
+                    existing.transport = transport
+                    existing.url = url
+                    existing.enabled = enabled
+                    existing.config = json.dumps(config or {}, ensure_ascii=False)
                 else:
                     session.add(MCPPlugin(
-                        id=config.id, name=config.name,
-                        description=config.description,
-                        transport=config.transport, url=config.url,
-                        enabled=config.enabled,
-                        config=json.dumps(config.config, ensure_ascii=False),
+                        id=server_id, plugin_name=plugin_name,
+                        description=description, transport=transport,
+                        url=url, enabled=enabled,
+                        config=json.dumps(config or {}, ensure_ascii=False),
                     ))
                 await session.commit()
 
-            await self._manager.register_server(config)
-            self._tool_cache.pop(config.id, None)
+            # Register with facade
+            await self._facade.register(
+                server_id=server_id, plugin_name=plugin_name,
+                url=url, transport=transport,
+                headers=(config or {}).get("headers"),
+            )
             return True
         except Exception as e:
-            logger.error("Failed to register MCP server %s: %s", config.id, e)
+            logger.error("Failed to register MCP server %s: %s", server_id, e)
             return False
 
     async def remove_server(self, server_id: str) -> bool:
         """Remove a registered MCP server from runtime and DB."""
         try:
-            # Remove from DB
             async with async_session_factory() as session:
                 result = await session.execute(
                     select(MCPPlugin).where(MCPPlugin.id == server_id))
@@ -95,19 +102,15 @@ class MCPService:
                 if row:
                     await session.delete(row)
                     await session.commit()
-
-            # Remove from runtime
-            await self._manager.unregister_server(server_id)
-            self._tool_cache.pop(server_id, None)
+            await self._facade.unregister(server_id)
             return True
         except Exception as e:
             logger.error("Failed to remove MCP server %s: %s", server_id, e)
             return False
 
     async def toggle_server(self, server_id: str, enabled: bool) -> bool:
-        """Enable or disable an MCP server. Updates DB + runtime."""
+        """Enable or disable an MCP server."""
         try:
-            # Update DB
             async with async_session_factory() as session:
                 result = await session.execute(
                     select(MCPPlugin).where(MCPPlugin.id == server_id))
@@ -115,92 +118,66 @@ class MCPService:
                 if row:
                     row.enabled = enabled
                     await session.commit()
-
-            # Update runtime
-            config = await self._get_server_config(server_id)
-            if config:
-                config.enabled = enabled
-                self._tool_cache.pop(server_id, None)
-                if enabled:
-                    await self._manager._discover_tools(server_id)
-                return True
-            return False
+            if not enabled:
+                await self._facade.unregister(server_id)
+            return True
         except Exception as e:
             logger.error("Failed to toggle MCP server %s: %s", server_id, e)
             return False
 
     async def test_server(self, server_id: str) -> dict:
         """Test connectivity to an MCP server."""
-        try:
-            result = await self._manager.health_check(server_id)
-            return {"server_id": server_id, "healthy": result, "error": None}
-        except Exception as e:
-            return {"server_id": server_id, "healthy": False, "error": str(e)}
+        return await self._facade.test_connection(server_id)
 
     async def list_servers(self) -> list[dict]:
-        """List all registered MCP servers."""
-        servers = await self._manager.get_servers()
-        return [
-            {"id": s.id, "name": s.name, "description": s.description,
-             "transport": s.transport, "url": s.url, "enabled": s.enabled}
-            for s in servers
-        ]
+        """List all registered MCP servers with their current status."""
+        sessions = self._facade.get_session_stats()
+        result = []
+        for sid, info in sessions.get("sessions", {}).items():
+            result.append({
+                "id": sid,
+                "name": info["plugin_name"],
+                "status": info["status"],
+                "error_count": info["error_count"],
+                "uptime_seconds": info["uptime_seconds"],
+            })
+        return result
 
     async def get_server(self, server_id: str) -> Optional[dict]:
-        """Get a single server config by ID."""
-        config = await self._get_server_config(server_id)
-        if not config:
+        """Get a single server by ID."""
+        sessions = self._facade.get_session_stats()
+        info = sessions.get("sessions", {}).get(server_id)
+        if not info:
             return None
-        return {
-            "id": config.id, "name": config.name, "description": config.description,
-            "transport": config.transport, "url": config.url, "enabled": config.enabled,
-            "config": config.config,
-        }
-
-    async def _get_server_config(self, server_id: str) -> Optional[MCPServerConfig]:
-        servers = await self._manager.get_servers()
-        for s in servers:
-            if s.id == server_id:
-                return s
-        return None
+        return {"id": server_id, "name": info["plugin_name"], "status": info["status"]}
 
     # ── Tool management ─────────────────────────────────────────────────
 
-    async def discover_tools(self, server_id: str) -> list[MCPTool]:
-        """Discover tools from an MCP server, with caching."""
-        if server_id in self._tool_cache:
-            return self._tool_cache[server_id]
-        tools = await self._manager.list_server_tools(server_id)
-        self._tool_cache[server_id] = tools
-        return tools
+    async def discover_tools(self, server_id: str) -> list[dict]:
+        """Get tools for a server (from cache, auto-refresh if expired)."""
+        return await self._facade.get_tools(server_id)
 
     async def list_all_tools(self) -> list[dict]:
-        """List tools from all enabled servers."""
-        all_tools = []
-        servers = await self._manager.get_servers()
-        for config in servers:
-            if not config.enabled:
-                continue
-            try:
-                tools = await self.discover_tools(config.id)
-                for tool in tools:
-                    all_tools.append({
-                        "name": tool.name, "description": tool.description,
-                        "parameters": tool.parameters,
-                        "server_id": config.id, "server_name": config.name,
-                    })
-            except Exception as e:
-                logger.warning("Failed to discover tools from %s: %s", config.id, e)
-        return all_tools
+        """List tools from all enabled servers in OpenAI Function Calling format."""
+        return self._facade.format_tools_for_openai()
 
     async def call_tool(self, server_id: str, tool_name: str, arguments: dict) -> dict:
-        return await self._manager.call_tool(server_id, tool_name, arguments)
+        """Call a tool on an MCP server with auto-reconnect."""
+        return await self._facade.call_tool(server_id, tool_name, arguments)
+
+    # ── Metrics & Cache ─────────────────────────────────────────────────
+
+    def get_metrics(self, server_id: Optional[str] = None) -> dict:
+        return self._facade.get_metrics(server_id)
+
+    def get_cache_stats(self) -> dict:
+        return self._facade.get_cache_stats()
 
     def clear_cache(self, server_id: Optional[str] = None):
         if server_id:
-            self._tool_cache.pop(server_id, None)
+            self._facade._tool_cache.pop(server_id, None)
         else:
-            self._tool_cache.clear()
+            self._facade._tool_cache.clear()
 
 
 # Singleton

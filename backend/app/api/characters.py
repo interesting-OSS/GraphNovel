@@ -1,11 +1,12 @@
-"""Character API routes — CRUD + AI generation + import/export."""
+"""Character API routes — CRUD + AI generation via graph + import/export."""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
 from app.models.character import Character
-from app.services.ai_service import create_ai_service
+from app.graphs.state import NovelState
 from app.config import settings
+from app.graphs.utils import get_gen_config
 from app.logger import get_logger
 import json
 
@@ -111,26 +112,31 @@ async def delete_character(character_id: str, db: AsyncSession = Depends(get_db)
 
 @router.post("/generate")
 async def generate_characters(data: dict):
-    """Generate characters via AI."""
-    ai = create_ai_service(
-        provider=data.get("provider", "openai"),
-        api_key=data.get("api_key"),
-        model=data.get("model", settings.default_ai_model),
-        temperature=0.8,
-        max_tokens=16000,
+    """Generate characters via graph's char_create subgraph nodes."""
+    from app.graphs.subgraphs.char_create import (
+        generate_protagonist, generate_supporting, generate_antagonist,
     )
-    prompt = f"""小说类型：{data.get('genre', '玄幻')}
-世界观：{data.get('world_context', '未设定')}
 
-请生成{data.get('count', 3)}个{data.get('role_type', 'supporting')}角色，以JSON数组格式输出。
-每个角色包含：name, gender, age, role_type, appearance, personality, background, goals, secrets, mental_state, power_level。
-只输出JSON数组。"""
+    role_type = data.get("role_type", "supporting")
+    state = NovelState(
+        project_id=data.get("project_id", ""),
+        title=data.get("title", ""),
+        genre=data.get("genre", "玄幻"),
+        world_setting=data.get("world_setting", {}),
+        characters=data.get("existing_characters", []),
+        generation_config=get_gen_config(data, temperature=0.8, max_tokens=16000),
+    )
 
     try:
-        result = await ai.generate_json("你是一位角色设计师。只输出JSON数组。", prompt)
-        if isinstance(result, dict):
-            result = [result]
-        return {"status": "completed", "characters": result}
+        if role_type == "protagonist":
+            result = await generate_protagonist(state)
+        elif role_type == "antagonist":
+            result = await generate_antagonist(state)
+        else:
+            result = await generate_supporting(state)
+
+        characters = result.get("characters", [])
+        return {"status": "completed", "characters": characters}
     except Exception as e:
         logger.error("Character generation failed: %s", e)
         return {"status": "failed", "error": str(e)}

@@ -36,4 +36,4 @@ class ProseAgent(BaseAgent):
     system_prompt = PROSE_SYSTEM_PROMPT
 
     def build_check_prompt(self, chapter_content: str) -> str:
-        return self.system_prompt.format(chapter_content=chapter_content)
+        return self.system_prompt.replace("{chapter_content}", chapter_content)

@@ -9,17 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _get_ai_service(state: NovelState, **overrides):
-    config = state.get("generation_config", {})
-    return create_ai_service(
-        provider=overrides.pop("provider", config.get("provider", "openai")),
-        api_key=overrides.pop("api_key", config.get("api_key", None)),
-        base_url=overrides.pop("base_url", config.get("base_url", None)),
-        model=overrides.pop("model", config.get("model", settings.default_ai_model)),
-        temperature=overrides.pop("temperature", config.get("temperature", 0.3)),
-        max_tokens=overrides.pop("max_tokens", config.get("max_tokens", 32000)),
-        **overrides,
-    )
+from app.graphs.utils import get_ai_service as _get_ai_service
 
 
 def _get_current_chapter(state: NovelState) -> dict:
@@ -39,7 +29,7 @@ def _get_previous_summary(state: NovelState) -> str:
 
 async def extract_plot(state: NovelState) -> dict:
     """Extract plot points, conflicts, and story progression."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.3)
     chapter = _get_current_chapter(state)
     content = chapter.get("content", "")
     if not content:
@@ -87,7 +77,7 @@ async def extract_plot(state: NovelState) -> dict:
 
 async def extract_foreshadows(state: NovelState) -> dict:
     """Identify foreshadows, hooks, and Chekhov's guns."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.3)
     chapter = _get_current_chapter(state)
     content = chapter.get("content", "")
     if not content:
@@ -150,7 +140,7 @@ async def extract_hooks(state: NovelState) -> dict:
 
 async def track_character_arc(state: NovelState) -> dict:
     """Track character arc progression and status changes."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.3)
     chapter = _get_current_chapter(state)
     content = chapter.get("content", "")
     characters = state.get("characters", [])
@@ -199,7 +189,7 @@ async def track_character_arc(state: NovelState) -> dict:
 
 async def analyze_emotional_arc(state: NovelState) -> dict:
     """Analyze emotional arc: primary emotion, intensity, trajectory."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.3)
     chapter = _get_current_chapter(state)
     content = chapter.get("content", "")
     if not content:
@@ -236,7 +226,7 @@ async def analyze_emotional_arc(state: NovelState) -> dict:
 
 async def analyze_pacing(state: NovelState) -> dict:
     """Analyze pacing: score, dialogue/description/narrative ratios."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.3)
     chapter = _get_current_chapter(state)
     content = chapter.get("content", "")
     if not content:
@@ -282,7 +272,7 @@ async def analyze_pacing(state: NovelState) -> dict:
 async def assess_quality(state: NovelState) -> dict:
     """Assess overall quality using AnalystAgent: engagement, coherence, composite score, suggestions."""
     from app.agents.analyst_agent import AnalystAgent
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.3)
     chapter = _get_current_chapter(state)
     content = chapter.get("content", "")
     if not content:
@@ -326,7 +316,7 @@ async def assess_quality(state: NovelState) -> dict:
 
 async def generate_summary(state: NovelState) -> dict:
     """Generate a structured chapter summary for the memory system."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.3)
     chapter = _get_current_chapter(state)
     content = chapter.get("content", "")
     if not content:
@@ -346,6 +336,7 @@ async def generate_summary(state: NovelState) -> dict:
     try:
         result = await ai.generate("你是一位精于概括的小说分析师。", prompt)
         summary = result.strip()
+        # Store summary in chapter_analyses for the post-analysis pipeline
         idx = state.get("current_chapter_index", 0)
         chapter_analyses = state.get("chapter_analyses", [])
         for a in chapter_analyses:
@@ -353,15 +344,7 @@ async def generate_summary(state: NovelState) -> dict:
                 a["summary"] = summary
                 break
 
-        # Also add to plot_memory for RAG retrieval
-        plot_memory = state.get("plot_memory", [])
-        plot_memory.append({
-            "chapter_index": idx,
-            "summary": summary,
-            "timestamp": None,
-        })
-
-        return {"chapter_analyses": chapter_analyses, "plot_memory": plot_memory,
+        return {"chapter_analyses": chapter_analyses,
                 "current_phase": "summary_generated"}
     except Exception as e:
         logger.error("generate_summary failed: %s", e)
@@ -446,13 +429,16 @@ async def post_analysis_pipeline_node(state: NovelState) -> dict:
     if 0 <= chapter_index < len(chapters):
         chapter_id = chapters[chapter_index].get("id", "")
 
-    # Collect all analysis results from the current state
+    # Collect all analysis results from the current state.
+    # Search by chapter_index field (analyses may not be in positional order).
     chapter_analyses = state.get("chapter_analyses", [])
     analysis_data = {}
-    if chapter_analyses and chapter_index < len(chapter_analyses):
-        analysis_data = chapter_analyses[chapter_index]
-    elif chapter_analyses:
-        analysis_data = chapter_analyses[-1]
+    for a in chapter_analyses:
+        if a.get("chapter_index") == chapter_index:
+            analysis_data = a
+            break
+    if not analysis_data and chapter_analyses:
+        analysis_data = chapter_analyses[-1]  # fallback: use most recent
 
     if not analysis_data or not project_id:
         logger.warning("Post-analysis skipped: no analysis data or project_id")
@@ -501,7 +487,6 @@ def create_chapter_analyze_subgraph():
 
     builder.add_node("extract_plot", extract_plot)
     builder.add_node("extract_foreshadows", extract_foreshadows)
-    builder.add_node("extract_hooks", extract_hooks)
     builder.add_node("track_character_arc", track_character_arc)
     builder.add_node("analyze_emotional_arc", analyze_emotional_arc)
     builder.add_node("analyze_pacing", analyze_pacing)
@@ -512,8 +497,7 @@ def create_chapter_analyze_subgraph():
 
     builder.set_entry_point("extract_plot")
     builder.add_edge("extract_plot", "extract_foreshadows")
-    builder.add_edge("extract_foreshadows", "extract_hooks")
-    builder.add_edge("extract_hooks", "track_character_arc")
+    builder.add_edge("extract_foreshadows", "track_character_arc")
     builder.add_edge("track_character_arc", "analyze_emotional_arc")
     builder.add_edge("analyze_emotional_arc", "analyze_pacing")
     builder.add_edge("analyze_pacing", "assess_quality")

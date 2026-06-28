@@ -43,14 +43,15 @@ class WriterAgent(BaseAgent):
         continuation_mode: str,
         chapter_outline: str,
     ) -> str:
-        """Build a complete writing prompt with all context assembled."""
-        return self.system_prompt.format(
-            genre=genre,
-            world_summary=world_summary,
-            volume_outline=volume_outline,
-            characters_context=characters_context,
-            active_foreshadows=active_foreshadows,
-            previous_chapter_summary=previous_chapter_summary,
-            writing_style=writing_style,
-            continuation_mode=continuation_mode,
-        ) + f"\n\n## 本章大纲要点\n{chapter_outline}\n\n请开始创作本章正文："
+        """Build a complete writing prompt with all context assembled. Uses replace()
+        to avoid str.format() KeyError when content contains curly braces."""
+        prompt = self.system_prompt
+        prompt = prompt.replace("{genre}", genre)
+        prompt = prompt.replace("{world_summary}", world_summary)
+        prompt = prompt.replace("{volume_outline}", volume_outline)
+        prompt = prompt.replace("{characters_context}", characters_context)
+        prompt = prompt.replace("{active_foreshadows}", active_foreshadows)
+        prompt = prompt.replace("{previous_chapter_summary}", previous_chapter_summary)
+        prompt = prompt.replace("{writing_style}", writing_style)
+        prompt = prompt.replace("{continuation_mode}", continuation_mode)
+        return prompt + f"\n\n## 本章大纲要点\n{chapter_outline}\n\n请开始创作本章正文："

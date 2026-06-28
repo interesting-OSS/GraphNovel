@@ -59,10 +59,11 @@ class AnalystAgent(BaseAgent):
         active_foreshadows: str,
         characters_info: str,
     ) -> str:
-        """Build a complete analysis prompt."""
-        return self.system_prompt.format(
-            chapter_content=chapter_content,
-            previous_summary=previous_summary,
-            active_foreshadows=active_foreshadows,
-            characters_info=characters_info,
-        )
+        """Build a complete analysis prompt. Uses replace() to avoid str.format()
+        KeyError when content contains curly braces (common in JSON output)."""
+        prompt = self.system_prompt
+        prompt = prompt.replace("{chapter_content}", chapter_content)
+        prompt = prompt.replace("{previous_summary}", previous_summary)
+        prompt = prompt.replace("{active_foreshadows}", active_foreshadows)
+        prompt = prompt.replace("{characters_info}", characters_info)
+        return prompt

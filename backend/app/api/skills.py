@@ -54,7 +54,7 @@ async def skill_chat_stream(data: dict):
             ai = create_ai_service(
                 provider=data.get("provider", "openai"),
                 api_key=data.get("api_key"),
-                model=data.get("model", settings.default_ai_model),
+                model=data.get("model", settings.default_llm_model),
                 temperature=0.7, max_tokens=8000,
             )
             skill_name = data.get("skill_name", "")
@@ -71,7 +71,7 @@ async def skill_chat_stream(data: dict):
                 full_response += chunk
                 yield SSEResponse.chunk(chunk)
 
-            yield SSEResponse.result({"response": full_response})
+            yield SSEResponse.result({"content": full_response, "operation": "skill"})
             yield SSEResponse.done("对话完成")
         except Exception as e:
             logger.error("Skill chat failed: %s", e)

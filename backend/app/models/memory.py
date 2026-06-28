@@ -1,7 +1,7 @@
 """Story memory and plot analysis models."""
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Integer, Text, DateTime, ForeignKey, Float, func
+from sqlalchemy import String, Integer, Text, DateTime, ForeignKey, Float, func, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
 
@@ -12,9 +12,11 @@ class StoryMemory(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     chapter_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("chapters.id", ondelete="CASCADE"), nullable=True)
+    chapter_index: Mapped[int] = mapped_column(Integer, default=0)
     content: Mapped[str] = mapped_column(Text, default="")
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     memory_type: Mapped[str] = mapped_column(String(50), default="plot")  # plot/character/event/foreshadow
+    memory_layer: Mapped[str] = mapped_column(String(20), default="short_term")  # short_term/mid_term/long_term
     embedding_id: Mapped[str | None] = mapped_column(String(200), nullable=True)  # ChromaDB embedding ID
     importance: Mapped[float] = mapped_column(Float, default=0.5)
     tags: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list
@@ -23,10 +25,14 @@ class StoryMemory(Base):
 
 class PlotAnalysis(Base):
     __tablename__ = "plot_analyses"
+    __table_args__ = (
+        UniqueConstraint("project_id", "chapter_id", name="uq_plot_analysis_per_chapter"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     chapter_id: Mapped[str] = mapped_column(String(36), ForeignKey("chapters.id", ondelete="CASCADE"), index=True)
+    chapter_index: Mapped[int] = mapped_column(Integer, default=0)
     plot_points: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
     conflict_info: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
     emotional_arc: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON

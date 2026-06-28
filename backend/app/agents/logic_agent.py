@@ -32,9 +32,9 @@ class LogicAgent(BaseAgent):
         characters_info: str,
         previous_events: str,
     ) -> str:
-        return self.system_prompt.format(
-            chapter_content=chapter_content,
-            world_setting=world_setting,
-            characters_info=characters_info,
-            previous_events=previous_events,
-        )
+        prompt = self.system_prompt
+        prompt = prompt.replace("{chapter_content}", chapter_content)
+        prompt = prompt.replace("{world_setting}", world_setting)
+        prompt = prompt.replace("{characters_info}", characters_info)
+        prompt = prompt.replace("{previous_events}", previous_events)
+        return prompt

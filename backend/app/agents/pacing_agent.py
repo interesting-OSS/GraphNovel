@@ -50,9 +50,9 @@ class PacingAgent(BaseAgent):
         total_chapters: int,
         story_phase: str,
     ) -> str:
-        return self.system_prompt.format(
-            chapter_content=chapter_content,
-            chapter_index=chapter_index,
-            total_chapters=total_chapters,
-            story_phase=story_phase,
-        )
+        prompt = self.system_prompt
+        prompt = prompt.replace("{chapter_content}", chapter_content)
+        prompt = prompt.replace("{chapter_index}", str(chapter_index))
+        prompt = prompt.replace("{total_chapters}", str(total_chapters))
+        prompt = prompt.replace("{story_phase}", story_phase)
+        return prompt

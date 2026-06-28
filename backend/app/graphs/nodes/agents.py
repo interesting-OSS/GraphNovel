@@ -13,6 +13,10 @@ Usage in a subgraph:
 from __future__ import annotations
 import time
 from typing import Optional, Any, Callable, Awaitable
+"""Callable 是一个用来声明一个变量或参数是可以被调用的对象【[参1，参2】返回3】
+   Awaitable 是一个异步函数的返回值类型，当一个函数需要接收一个异步函数作为参数，
+   那么这个函数的返回值类型就是 Awaitable[Any]。
+"""
 from app.graphs.state import NovelState
 from app.agents.base_agent import BaseAgent
 from app.services.ai_service import AIService, create_ai_service
@@ -141,7 +145,7 @@ class AgentNode:
             logger.info("No MCP tools available, falling back to plain generation")
             return await self._ai_service.generate(system_prompt, user_prompt)
 
-        model = self._ai_service._get_model()
+        model = self._ai_service.model
         return await run_tool_calling_loop(
             model=model,
             system_prompt=system_prompt,
@@ -159,11 +163,11 @@ class AgentNode:
                 provider=config.get("provider", "openai"),
                 api_key=config.get("api_key"),
                 base_url=config.get("base_url"),
-                model=config.get("model", settings.default_ai_model),
+                model=config.get("model", settings.default_llm_model),
                 temperature=config.get("temperature", 0.7),
                 max_tokens=config.get("max_tokens", 32000),
             )
-            self.agent.set_model(self._ai_service._get_model())
+            self.agent.set_model(self._ai_service.model)
 
     def _build_system_prompt(self, state: NovelState) -> str:
         base = self.agent.system_prompt

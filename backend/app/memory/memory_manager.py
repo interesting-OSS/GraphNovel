@@ -30,89 +30,68 @@ class MemoryManager:
     ) -> List[str]:
         """Add a chapter's content and analysis to the memory system.
 
-        Creates multiple embeddings at different memory layers.
+        Uses batch insertion for efficiency — one async encode + one write.
         Returns list of embedding IDs.
         """
-        embedding_ids = []
+        import uuid
+        texts, metadatas, eids = [], [], []
 
         # Short-term: Full chapter key excerpts
         if content:
             excerpts = self._split_content(content, max_chars=2000)
             for i, excerpt in enumerate(excerpts):
-                eid = self.vector_store.add_memory(
-                    text=excerpt,
-                    metadata={
-                        "project_id": project_id,
-                        "chapter_id": chapter_id,
-                        "chapter_index": chapter_index,
-                        "memory_layer": "short_term",
-                        "type": "chapter_excerpt",
-                        "part": i,
-                    },
-                )
-                embedding_ids.append(eid)
+                texts.append(excerpt)
+                metadatas.append({
+                    "project_id": project_id, "chapter_id": chapter_id,
+                    "chapter_index": chapter_index, "memory_layer": "short_term",
+                    "type": "chapter_excerpt", "part": i,
+                })
+                eids.append(str(uuid.uuid4()))
 
         # Mid-term: Chapter summary
         if summary:
-            eid = self.vector_store.add_memory(
-                text=summary,
-                metadata={
-                    "project_id": project_id,
-                    "chapter_id": chapter_id,
-                    "chapter_index": chapter_index,
-                    "memory_layer": "mid_term",
-                    "type": "chapter_summary",
-                },
-            )
-            embedding_ids.append(eid)
+            texts.append(summary)
+            metadatas.append({
+                "project_id": project_id, "chapter_id": chapter_id,
+                "chapter_index": chapter_index, "memory_layer": "mid_term",
+                "type": "chapter_summary",
+            })
+            eids.append(str(uuid.uuid4()))
 
         # Long-term: Plot points
         for point in plot_points:
-            eid = self.vector_store.add_memory(
-                text=point.get("description", ""),
-                metadata={
-                    "project_id": project_id,
-                    "chapter_id": chapter_id,
-                    "chapter_index": chapter_index,
-                    "memory_layer": "long_term",
-                    "type": "plot_point",
-                    "importance": point.get("importance", 0.5),
-                },
-            )
-            embedding_ids.append(eid)
+            texts.append(point.get("description", ""))
+            metadatas.append({
+                "project_id": project_id, "chapter_id": chapter_id,
+                "chapter_index": chapter_index, "memory_layer": "long_term",
+                "type": "plot_point", "importance": point.get("importance", 0.5),
+            })
+            eids.append(str(uuid.uuid4()))
 
         # Character state changes
         for change in character_changes:
-            eid = self.vector_store.add_memory(
-                text=change.get("description", ""),
-                metadata={
-                    "project_id": project_id,
-                    "chapter_id": chapter_id,
-                    "chapter_index": chapter_index,
-                    "memory_layer": "long_term",
-                    "type": "character_change",
-                    "character_id": change.get("character_id", ""),
-                },
-            )
-            embedding_ids.append(eid)
+            texts.append(change.get("description", ""))
+            metadatas.append({
+                "project_id": project_id, "chapter_id": chapter_id,
+                "chapter_index": chapter_index, "memory_layer": "long_term",
+                "type": "character_change", "character_id": change.get("character_id", ""),
+            })
+            eids.append(str(uuid.uuid4()))
 
         # Foreshadows
         for fs in foreshadows:
-            eid = self.vector_store.add_memory(
-                text=fs.get("description", ""),
-                metadata={
-                    "project_id": project_id,
-                    "chapter_id": chapter_id,
-                    "chapter_index": chapter_index,
-                    "memory_layer": "long_term",
-                    "type": "foreshadow",
-                    "foreshadow_id": fs.get("id", ""),
-                    "status": fs.get("status", "pending"),
-                },
-            )
-            embedding_ids.append(eid)
+            texts.append(fs.get("description", ""))
+            metadatas.append({
+                "project_id": project_id, "chapter_id": chapter_id,
+                "chapter_index": chapter_index, "memory_layer": "long_term",
+                "type": "foreshadow", "foreshadow_id": fs.get("id", ""),
+                "status": fs.get("status", "pending"),
+            })
+            eids.append(str(uuid.uuid4()))
 
-        return embedding_ids
+        if texts:
+            await self.vector_store.add_memories_batch_async(texts, metadatas, eids)
+        return eids
 
     async def retrieve_context(
         self,
@@ -121,12 +100,10 @@ class MemoryManager:
         n_results: int = 10,
     ) -> dict:
         """Retrieve relevant memories for the current writing context."""
-        results = self.vector_store.search(
-            query=query,
-            n_results=n_results,
+        return await self.vector_store.search_async(
+            query=query, n_results=n_results,
             filter_metadata={"project_id": project_id},
         )
-        return results
 
     async def retrieve_context_with_scores(
         self,
@@ -139,9 +116,8 @@ class MemoryManager:
 
         Returns list of (document, similarity_score) tuples.
         """
-        return self.vector_store.search_with_scores(
-            query=query,
-            n_results=n_results,
+        return await self.vector_store.search_with_scores_async(
+            query=query, n_results=n_results,
             filter_metadata={"project_id": project_id},
             min_similarity=min_similarity,
         )
@@ -154,9 +130,8 @@ class MemoryManager:
         n_results: int = 10,
     ) -> dict:
         """Retrieve memories from a specific layer (short_term/mid_term/long_term)."""
-        return self.vector_store.search(
-            query=query,
-            n_results=n_results,
+        return await self.vector_store.search_async(
+            query=query, n_results=n_results,
             filter_metadata={
                 "project_id": project_id,
                 "memory_layer": layer,
@@ -165,7 +140,7 @@ class MemoryManager:
 
     async def delete_project_memories(self, project_id: str):
         """Delete all memories for a project."""
-        self.vector_store.delete_by_project(project_id)
+        await self.vector_store.delete_by_project_async(project_id)
 
     @staticmethod
     def _split_content(text: str, max_chars: int = 2000) -> List[str]:
@@ -178,3 +153,7 @@ class MemoryManager:
             if chunk:
                 chunks.append(chunk)
         return chunks
+
+
+# 全局单例 — 整个进程共享一个 MemoryManager
+memory_manager = MemoryManager()

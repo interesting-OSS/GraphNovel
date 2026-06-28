@@ -253,6 +253,7 @@ class AnalysisPipeline:
             analysis = PlotAnalysis(
                 project_id=project_id,
                 chapter_id=chapter_id,
+                chapter_index=chapter_index,
                 plot_points=json.dumps(analysis_data.get("plot_points", []), ensure_ascii=False),
                 conflict_info=json.dumps(analysis_data.get("conflict_info", {}), ensure_ascii=False),
                 emotional_arc=json.dumps(analysis_data.get("emotional_arc", {}), ensure_ascii=False),
@@ -280,9 +281,11 @@ class AnalysisPipeline:
                 memory = StoryMemory(
                     project_id=project_id,
                     chapter_id=chapter_id,
+                    chapter_index=chapter_index,
                     content=point.get("description", str(point)[:500]),
                     summary=point.get("summary", ""),
                     memory_type="plot",
+                    memory_layer="mid_term",
                     importance=point.get("importance", 0.5),
                     tags=json.dumps(point.get("tags", []), ensure_ascii=False),
                 )
@@ -392,13 +395,12 @@ class AnalysisPipeline:
             await db.commit()
         return {"relationships_updated": updated}
 
-
-# ── Helpers ──────────────────────────────────────────────────────────────
-
-
     def set_memory_manager(self, memory_manager):
         """Wire in the MemoryManager for ChromaDB vector writes."""
         self._memory_manager = memory_manager
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────
 
 
 async def _step(name: str, coro):

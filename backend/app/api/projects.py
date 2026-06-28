@@ -113,13 +113,46 @@ async def update_project(project_id: str, data: dict, db: AsyncSession = Depends
 
 @router.delete("/{project_id}")
 async def delete_project(project_id: str, db: AsyncSession = Depends(get_db)):
-    """Delete a project and all associated data."""
+    """Delete a project and all associated data (cascading)."""
+    import logging
+    _log = logging.getLogger(__name__)
+
     result = await db.execute(select(Project).where(Project.id == project_id))
     project = result.scalar_one_or_none()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # Bulk delete child rows (single DELETE per model, avoids N+1)
+    from sqlalchemy import delete as sql_delete
+    from app.models.chapter import Chapter
+    from app.models.outline import Outline
+    from app.models.character import Character
+    from app.models.relationship import Career, Organization, OrganizationMember, CharacterRelationship
+    from app.models.foreshadow import Foreshadow
+    from app.models.generation import GenerationHistory
+    from app.models.memory import PlotAnalysis
+    from app.models.background_task import BackgroundTask
+
+    # Models with project_id: simple bulk delete
+    for model in [Foreshadow, GenerationHistory, PlotAnalysis, Chapter, Outline,
+                  Character, Career, Organization, BackgroundTask]:
+        try:
+            await db.execute(sql_delete(model).where(model.project_id == project_id))
+        except Exception as e:
+            _log.warning("Failed to cascade delete %s: %s", model.__name__, e)
+
+    # Models without project_id: delete via FK (OrganizationMember, CharacterRelationship)
+    for model in [CharacterRelationship]:
+        try:
+            await db.execute(sql_delete(model).where(model.project_id == project_id))
+        except Exception as e:
+            _log.warning("Failed to cascade delete %s: %s", model.__name__, e)
+    # OrganizationMember: deleted via organization_id join or cascade from above
+
+    await db.flush()
     await db.delete(project)
     await db.commit()
+    _log.info("Project %s deleted successfully", project_id)
     return {"deleted": True}
 
 

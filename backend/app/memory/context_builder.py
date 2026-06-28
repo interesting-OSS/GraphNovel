@@ -78,7 +78,7 @@ class ContextBuilder:
             ol = outlines[i]
             marker = " → 【当前】" if i == current_index else ""
             lines.append(
-                f"第{ol.get('volume', 1)}卷 第{ol.get('chapter_num', i + 1)}章 "
+                f"第{ol.get('volume', 1)}卷 第{ol.get('chapter_index', ol.get('chapter_num', i + 1))}章 "
                 f"《{ol.get('title', '未命名')}》{marker}\n"
                 f"  摘要: {ol.get('summary', '无')}\n"
                 f"  要点: {ol.get('key_points', '无')}\n"

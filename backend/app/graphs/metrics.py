@@ -112,7 +112,3 @@ def get_project_metrics(project_id: str) -> dict:
         "timeline": phases,
     }
 
-
-def clear_project_metrics(project_id: str):
-    """Delete all metrics for a project."""
-    _metrics_store.pop(project_id, None)

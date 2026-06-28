@@ -40,17 +40,7 @@ def _record_metric(project_id: str, node: str, phase: str, start: float, ok: boo
         pass
 
 
-def _get_ai_service(state: NovelState, **overrides):
-    config = state.get("generation_config", {})
-    return create_ai_service(
-        provider=overrides.pop("provider", config.get("provider", "openai")),
-        api_key=overrides.pop("api_key", config.get("api_key", None)),
-        base_url=overrides.pop("base_url", config.get("base_url", None)),
-        model=overrides.pop("model", config.get("model", settings.default_ai_model)),
-        temperature=overrides.pop("temperature", config.get("temperature", 0.7)),
-        max_tokens=overrides.pop("max_tokens", config.get("max_tokens", 32000)),
-        **overrides,
-    )
+from app.graphs.utils import get_ai_service as _get_ai_service
 
 
 # ============= Core nodes =============
@@ -83,11 +73,21 @@ async def project_init_node(state: NovelState) -> dict:
             result = await ai.generate_json(
                 "你是一位资深的出版编辑，擅长为小说命名和撰写简介。只输出JSON。", prompt)
             _record_metric(project_id, "project_init", state.get("current_phase", ""), t0, True)
+
+            new_title = result.get("title", title)
+            new_desc = result.get("description", description)
+            new_genre = result.get("genre_refined", genre)
+            new_perspective = result.get("narrative_perspective", "第三人称")
+
+            # Sync to DB
+            from app.graphs.graph_db_sync import sync_project_init
+            await sync_project_init(project_id, new_title, new_desc, new_genre, new_perspective)
+
             return {
-                "title": result.get("title", title),
-                "description": result.get("description", description),
-                "narrative_perspective": result.get("narrative_perspective", "第三人称"),
-                "genre": result.get("genre_refined", genre),
+                "title": new_title,
+                "description": new_desc,
+                "narrative_perspective": new_perspective,
+                "genre": new_genre,
                 "current_phase": "project_init_complete",
             }
         except Exception as e:
@@ -137,7 +137,7 @@ async def outline_plan_node(state: NovelState) -> dict:
   "outlines": [
     {{
       "volume": 1,
-      "chapter_num": 1,
+      "chapter_index": 1,
       "title": "章节标题",
       "summary": "章节内容摘要（50-150字）",
       "key_points": "关键情节要点",
@@ -160,6 +160,11 @@ async def outline_plan_node(state: NovelState) -> dict:
         result = await ai.generate_json("你是一位资深的小说结构规划师。只输出JSON。", prompt)
         outlines = result.get("outlines", [])
         _record_metric(project_id, "outline_plan", state.get("current_phase", ""), t0, True)
+
+        # Sync to DB
+        from app.graphs.graph_db_sync import sync_outlines
+        await sync_outlines(project_id, outlines)
+
         return {
             "outlines": outlines,
             "current_phase": "outline_plan_complete",
@@ -204,6 +209,11 @@ async def career_manage_node(state: NovelState) -> dict:
         if isinstance(result, dict):
             result = [result]
         _record_metric(project_id, "career_manage", state.get("current_phase", ""), t0, True)
+
+        # Sync to DB
+        from app.graphs.graph_db_sync import sync_careers
+        await sync_careers(project_id, result)
+
         return {
             "careers": result,
             "current_phase": "career_manage_complete",
@@ -249,6 +259,11 @@ async def organization_node(state: NovelState) -> dict:
         if isinstance(result, dict):
             result = [result]
         _record_metric(project_id, "organization", state.get("current_phase", ""), t0, True)
+
+        # Sync to DB
+        from app.graphs.graph_db_sync import sync_organizations
+        await sync_organizations(project_id, result)
+
         return {
             "organizations": result,
             "current_phase": "organization_complete",
@@ -260,24 +275,16 @@ async def organization_node(state: NovelState) -> dict:
 
 
 async def memory_update_node(state: NovelState) -> dict:
-    """Update long-term memory with current chapter content.
+    """Mark the memory update phase as complete.
 
-    This node integrates with the MemoryManager to vectorize chapter content
-    and store it in ChromaDB for future semantic retrieval.
+    Actual memory operations (SQL + ChromaDB vector store) are performed by
+    AnalysisPipeline.run_full_pipeline() during the chapter_analyze subgraph's
+    post_analysis_pipeline step. This node serves as a phase marker for the
+    main graph flow.
     """
-    chapters = state.get("chapters", [])
-    chapter_analyses = state.get("chapter_analyses", [])
-    plot_memory = state.get("plot_memory", [])
-    current_idx = state.get("current_chapter_index", 0)
-
-    # The actual vector store operations happen in MemoryManager.add_chapter_memory()
-    # which is called from the API layer when chapter generation completes.
-    # This node marks the memory update phase as complete.
-    logger.info("Memory update triggered for chapter %d", current_idx)
-    return {
-        "current_phase": "memory_update_complete",
-        "plot_memory": plot_memory,
-    }
+    chapter_index = state.get("current_chapter_index", 0)
+    logger.info("Memory update phase marked for chapter %d", chapter_index)
+    return {"current_phase": "memory_update_complete"}
 
 
 async def foreshadow_node(state: NovelState) -> dict:
@@ -288,14 +295,14 @@ async def foreshadow_node(state: NovelState) -> dict:
     """
     foreshadows = state.get("foreshadows", [])
     chapter_analyses = state.get("chapter_analyses", [])
-    current_idx = state.get("current_chapter_index", 0)
+    chapter_index = state.get("current_chapter_index", 0)
 
     # Foreshadows are already synced in the chapter_analyze subgraph
     # This node just ensures the state is consistent before proceeding
     active_count = sum(1 for f in foreshadows if f.get("status") == "set")
     resolved_count = sum(1 for f in foreshadows if f.get("status") == "resolved")
     logger.info("Foreshadow status: %d active, %d resolved, heading to chapter %d",
-                active_count, resolved_count, current_idx)
+                active_count, resolved_count, chapter_index)
 
     return {"current_phase": "foreshadow_complete"}
 

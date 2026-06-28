@@ -18,8 +18,8 @@ class SSEResponse:
         return SSEResponse.format(payload)
 
     @staticmethod
-    def chunk(content: str, **kwargs) -> str:
-        return SSEResponse.format({"type": "chunk", "content": content, **kwargs})
+    def chunk(text: str, **kwargs) -> str:
+        return SSEResponse.format({"type": "chunk", "chunk": text, **kwargs})
 
     @staticmethod
     def result(data: dict) -> str:

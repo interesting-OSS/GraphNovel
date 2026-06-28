@@ -2,12 +2,11 @@
 from typing import Literal, Optional, AsyncGenerator
 from langgraph.graph import StateGraph, END
 from app.graphs.state import NovelState
-from app.services.ai_service import create_ai_service
+from app.graphs.utils import get_ai_service as _get_ai_service
 from app.agents.writer_agent import WriterAgent
 from app.agents.editor_agent import EditorAgent
 from app.memory.context_builder import ContextBuilder
 from app.graphs.nodes.retrieval import RetrievalNode
-from app.config import settings
 import logging
 
 logger = logging.getLogger(__name__)
@@ -18,7 +17,7 @@ async def build_context(state: NovelState) -> dict:
     world = state.get("world_setting", {})
     characters = state.get("characters", [])
     outlines = state.get("outlines", [])
-    current_idx = state.get("current_chapter_index", 0)
+    chapter_index = state.get("current_chapter_index", 0)
     foreshadows = state.get("foreshadows", [])
     chapters = state.get("chapters", [])
 
@@ -32,7 +31,7 @@ async def build_context(state: NovelState) -> dict:
         retrieval_result = await retrieval(state)
         memories = retrieval_result.get("_retrieved_memories", [])
         retrieved_texts = [m.get("content", "") for m in memories if m.get("content")]
-        logger.info("RAG retrieved %d memories for chapter %d", len(retrieved_texts), current_idx + 1)
+        logger.info("RAG retrieved %d memories for chapter %d", len(retrieved_texts), chapter_index + 1)
     except Exception as exc:
         logger.warning("RAG retrieval skipped: %s", exc)
 
@@ -41,7 +40,7 @@ async def build_context(state: NovelState) -> dict:
         world_setting=world,
         characters=characters,
         outlines=outlines,
-        current_chapter_index=current_idx,
+        current_chapter_index=chapter_index,
         active_foreshadows=foreshadows,
         previous_chapter_content=chapters[-1].get("content", "") if chapters else None,
         retrieved_memories=retrieved_texts if retrieved_texts else None,
@@ -49,15 +48,15 @@ async def build_context(state: NovelState) -> dict:
 
     # Get the current chapter outline
     current_outline = {}
-    if 0 <= current_idx < len(outlines):
-        current_outline = outlines[current_idx]
+    if 0 <= chapter_index < len(outlines):
+        current_outline = outlines[chapter_index]
 
     context["current_outline"] = current_outline
     context["genre"] = state.get("genre", "玄幻")
     context["writing_style"] = state.get("writing_style_id", "默认风格")
     context["narrative_perspective"] = state.get("narrative_perspective", "第三人称")
 
-    logger.info("Chapter %d writing context built", current_idx + 1)
+    logger.info("Chapter %d writing context built", chapter_index + 1)
     return {"current_phase": "context_built", "_writing_context": context}
 
 
@@ -68,7 +67,7 @@ async def generate_draft(state: NovelState, *, writer: Optional[WriterAgent] = N
     current_outline = context.get("current_outline", {})
     genre = context.get("genre", "玄幻")
 
-    writer_agent = writer or WriterAgent(model=ai._get_model())
+    writer_agent = writer or WriterAgent(model=ai.model)
     prompt = writer_agent.build_writing_prompt(
         genre=genre,
         world_summary=context.get("world_summary", "暂无世界观设定"),
@@ -81,17 +80,29 @@ async def generate_draft(state: NovelState, *, writer: Optional[WriterAgent] = N
         chapter_outline=current_outline.get("summary", current_outline.get("title", "请根据大纲进行创作")),
     )
 
+    # Inject active skill into system prompt if set
+    active_skill = state.get("active_skill", "")
+    skill_prompt = writer_agent.system_prompt
+    if active_skill:
+        from app.skills.loader import get_skill_loader
+        loader = get_skill_loader()
+        skill = loader.load(active_skill)
+        if skill:
+            skill_prompt = skill.get_injected_prompt(base_prompt=writer_agent.system_prompt)
+
     try:
-        # Use non-streaming for graph node execution
-        # Streaming is handled at the API level via astream_events
-        result = await ai.generate(writer_agent.system_prompt, prompt)
+        # Use streaming LLM call so astream_events can capture tokens in real-time
+        full_text = ""
+        async for token in ai.generate_stream(skill_prompt, prompt):
+            full_text += token
+        result = full_text.strip()
 
         chapters = state.get("chapters", [])
-        current_idx = state.get("current_chapter_index", 0)
+        chapter_index = state.get("current_chapter_index", 0)
         new_chapter = {
-            "index": current_idx,
-            "title": current_outline.get("title", f"第{current_idx + 1}章"),
-            "content": result.strip(),
+            "chapter_index": chapter_index,
+            "title": current_outline.get("title", f"第{chapter_index}章"),
+            "content": result,
             "word_count": len(result),
             "status": "draft",
             "writing_style_id": state.get("writing_style_id"),
@@ -99,10 +110,18 @@ async def generate_draft(state: NovelState, *, writer: Optional[WriterAgent] = N
         }
 
         # Update or append chapter
-        if 0 <= current_idx < len(chapters):
-            chapters[current_idx] = new_chapter
+        if 0 <= chapter_index < len(chapters):
+            chapters[chapter_index] = new_chapter
         else:
             chapters.append(new_chapter)
+
+        # Sync to DB
+        project_id = state.get("project_id", "")
+        if project_id:
+            from app.graphs.graph_db_sync import sync_chapter
+            chapter_id = await sync_chapter(project_id, new_chapter)
+            if chapter_id:
+                new_chapter["id"] = chapter_id
 
         return {
             "chapters": chapters,
@@ -110,7 +129,7 @@ async def generate_draft(state: NovelState, *, writer: Optional[WriterAgent] = N
             "total_word_count": sum(c.get("word_count", 0) for c in chapters),
         }
     except Exception as e:
-        logger.error("generate_draft failed for chapter %d: %s", current_idx + 1, e)
+        logger.error("generate_draft failed for chapter %d: %s", chapter_index + 1, e)
         return {"current_phase": "draft_generated", "error": str(e)}
 
 
@@ -119,13 +138,13 @@ async def apply_feedback(state: NovelState) -> dict:
     from app.graphs.nodes.agents import AgentNode
     ai = _get_ai_service(state)
     chapters = state.get("chapters", [])
-    current_idx = state.get("current_chapter_index", 0)
+    chapter_index = state.get("current_chapter_index", 0)
 
-    if not (0 <= current_idx < len(chapters) and chapters[current_idx].get("content")):
+    if not (0 <= chapter_index < len(chapters) and chapters[chapter_index].get("content")):
         return {"current_phase": "feedback_applied", "human_feedback": None}
 
     editor = EditorAgent(model=ai.model)
-    chapter_content = chapters[current_idx]["content"]
+    chapter_content = chapters[chapter_index]["content"]
     feedback = state.get("human_feedback", "请改善文笔")
 
     # Use AgentNode for automatic retry, error handling, and metrics tracking
@@ -158,11 +177,11 @@ async def rewrite_partial(state: NovelState) -> dict:
     ai = _get_ai_service(state)
     feedback = state.get("human_feedback", "请重写选中段落")
     chapters = state.get("chapters", [])
-    current_idx = state.get("current_chapter_index", 0)
+    chapter_index = state.get("current_chapter_index", 0)
 
-    if 0 <= current_idx < len(chapters) and chapters[current_idx].get("content"):
-        editor = EditorAgent(model=ai._get_model())
-        chapter_content = chapters[current_idx]["content"]
+    if 0 <= chapter_index < len(chapters) and chapters[chapter_index].get("content"):
+        editor = EditorAgent(model=ai.model)
+        chapter_content = chapters[chapter_index]["content"]
         prompt = editor.build_rewrite_prompt(
             original_text=chapter_content,
             feedback=feedback,
@@ -170,9 +189,9 @@ async def rewrite_partial(state: NovelState) -> dict:
         )
         try:
             result = await ai.generate(editor.system_prompt, prompt)
-            chapters[current_idx]["content"] = result.strip()
-            chapters[current_idx]["status"] = "draft"
-            chapters[current_idx]["word_count"] = len(result)
+            chapters[chapter_index]["content"] = result.strip()
+            chapters[chapter_index]["status"] = "draft"
+            chapters[chapter_index]["word_count"] = len(result)
             return {"chapters": chapters, "current_phase": "partial_rewrite_done", "human_feedback": None}
         except Exception as e:
             logger.error("rewrite_partial failed: %s", e)
@@ -186,12 +205,12 @@ async def rewrite_full(state: NovelState) -> dict:
     ai = _get_ai_service(state)
     feedback = state.get("human_feedback", "请完全重写本章")
     chapters = state.get("chapters", [])
-    current_idx = state.get("current_chapter_index", 0)
+    chapter_index = state.get("current_chapter_index", 0)
     context = state.get("_writing_context", {})
 
-    if 0 <= current_idx < len(chapters) and chapters[current_idx].get("content"):
-        editor = EditorAgent(model=ai._get_model())
-        chapter_content = chapters[current_idx]["content"]
+    if 0 <= chapter_index < len(chapters) and chapters[chapter_index].get("content"):
+        editor = EditorAgent(model=ai.model)
+        chapter_content = chapters[chapter_index]["content"]
         prompt = editor.build_rewrite_prompt(
             original_text=chapter_content,
             feedback=feedback,
@@ -199,9 +218,9 @@ async def rewrite_full(state: NovelState) -> dict:
         )
         try:
             result = await ai.generate(editor.system_prompt, prompt)
-            chapters[current_idx]["content"] = result.strip()
-            chapters[current_idx]["status"] = "draft"
-            chapters[current_idx]["word_count"] = len(result)
+            chapters[chapter_index]["content"] = result.strip()
+            chapters[chapter_index]["status"] = "draft"
+            chapters[chapter_index]["word_count"] = len(result)
             return {"chapters": chapters, "current_phase": "full_rewrite_done", "human_feedback": None}
         except Exception as e:
             logger.error("rewrite_full failed: %s", e)
@@ -214,17 +233,24 @@ async def polish_text(state: NovelState) -> dict:
     """Polish the chapter prose: adjust pacing, dialogue, description ratios."""
     ai = _get_ai_service(state)
     chapters = state.get("chapters", [])
-    current_idx = state.get("current_chapter_index", 0)
+    chapter_index = state.get("current_chapter_index", 0)
 
-    if 0 <= current_idx < len(chapters) and chapters[current_idx].get("content"):
-        editor = EditorAgent(model=ai._get_model())
-        chapter_content = chapters[current_idx]["content"]
+    if 0 <= chapter_index < len(chapters) and chapters[chapter_index].get("content"):
+        editor = EditorAgent(model=ai.model)
+        chapter_content = chapters[chapter_index]["content"]
         prompt = editor.build_polish_prompt(original_text=chapter_content)
         try:
             result = await ai.generate(editor.system_prompt, prompt)
-            chapters[current_idx]["content"] = result.strip()
-            chapters[current_idx]["status"] = "polished"
-            chapters[current_idx]["word_count"] = len(result)
+            chapters[chapter_index]["content"] = result.strip()
+            chapters[chapter_index]["status"] = "polished"
+            chapters[chapter_index]["word_count"] = len(result)
+
+            # Sync polished content to DB
+            project_id = state.get("project_id", "")
+            if project_id:
+                from app.graphs.graph_db_sync import sync_chapter
+                await sync_chapter(project_id, chapters[chapter_index])
+
             return {"chapters": chapters, "current_phase": "polish_done", "human_feedback": None}
         except Exception as e:
             logger.error("polish_text failed: %s", e)
@@ -236,25 +262,32 @@ async def polish_text(state: NovelState) -> dict:
 async def save_generation_history(state: NovelState) -> dict:
     """Save the generation version and compute diff."""
     chapters = state.get("chapters", [])
-    current_idx = state.get("current_chapter_index", 0)
+    chapter_index = state.get("current_chapter_index", 0)
     history = state.get("generation_history", [])
 
-    if 0 <= current_idx < len(chapters):
-        chapter = chapters[current_idx]
-        version = len([h for h in history if h.get("chapter_index") == current_idx]) + 1
+    if 0 <= chapter_index < len(chapters):
+        chapter = chapters[chapter_index]
+        version = len([h for h in history if h.get("chapter_index") == chapter_index]) + 1
         import uuid
         history.append({
             "id": str(uuid.uuid4()),
-            "chapter_index": current_idx,
+            "chapter_index": chapter_index,
             "version": version,
             "content": chapter.get("content", ""),
             "created_at": None,  # Will be set by DB layer
         })
 
+        # Sync approved chapter to DB
+        project_id = state.get("project_id", "")
+        if project_id:
+            from app.graphs.graph_db_sync import sync_chapter
+            chapter_data = {**chapter, "status": "final"}
+            await sync_chapter(project_id, chapter_data)
+
     return {
         "generation_history": history,
         "current_phase": "history_saved",
-        "current_chapter_index": current_idx + 1,  # Advance to next chapter
+        "current_chapter_index": chapter_index + 1,  # Advance to next chapter
     }
 
 
@@ -266,8 +299,8 @@ async def human_review(state: NovelState) -> dict:
     When the user resumes with a Command(resume=...), human_feedback
     is already set in state, and route_review handles the routing.
     """
-    current_idx = state.get("current_chapter_index", 0)
-    logger.info("Human review checkpoint for chapter %d", current_idx + 1)
+    chapter_index = state.get("current_chapter_index", 0)
+    logger.info("Human review checkpoint for chapter %d", chapter_index + 1)
     return {"current_phase": "awaiting_review"}
 
 
@@ -295,19 +328,6 @@ def _get_continuation_mode(state: NovelState) -> str:
     """Extract continuation mode from state."""
     return state.get("generation_config", {}).get("continuation_mode", "auto")
 
-
-def _get_ai_service(state: NovelState, **overrides):
-    """Get an AI service instance from state generation config."""
-    config = state.get("generation_config", {})
-    return create_ai_service(
-        provider=overrides.pop("provider", config.get("provider", "openai")),
-        api_key=overrides.pop("api_key", config.get("api_key", None)),
-        base_url=overrides.pop("base_url", config.get("base_url", None)),
-        model=overrides.pop("model", config.get("model", settings.default_ai_model)),
-        temperature=overrides.pop("temperature", config.get("temperature", 0.7)),
-        max_tokens=overrides.pop("max_tokens", config.get("max_tokens", 32000)),
-        **overrides,
-    )
 
 
 def create_chapter_write_subgraph():

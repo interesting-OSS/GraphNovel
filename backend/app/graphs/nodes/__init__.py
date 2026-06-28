@@ -1,10 +1,7 @@
 """Reusable LangGraph nodes for the novel creation platform.
 
-AgentNode     — wraps any BaseAgent with streaming, retry, and state update.
-                Set enable_mcp_tools=True for dynamic MCP tool-calling.
-RetrievalNode — RAG retrieval and context injection.
-
-(ToolNode is deprecated — use AgentNode(enable_mcp_tools=True) instead.)
+AgentNode     — wraps any BaseAgent with streaming, retry, MCP tools, and state update.
+RetrievalNode — RAG retrieval and context injection into the writing state.
 """
 
 from app.graphs.nodes.agents import AgentNode

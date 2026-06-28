@@ -29,8 +29,9 @@ class EditorAgent(BaseAgent):
     system_prompt = EDITOR_SYSTEM_PROMPT
 
     def build_polish_prompt(self, original_text: str, style_notes: str = "") -> str:
-        """Build a polish/edit prompt."""
-        prompt = self.system_prompt.format(original_text=original_text)
+        """Build a polish/edit prompt. Uses replace() to avoid str.format() KeyError
+        when content contains curly braces (common in JSON output)."""
+        prompt = self.system_prompt.replace("{original_text}", original_text)
         if style_notes:
             prompt += f"\n\n## 额外风格要求\n{style_notes}"
         return prompt

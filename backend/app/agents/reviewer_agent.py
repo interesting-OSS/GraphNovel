@@ -21,7 +21,7 @@ class ReviewerAgent(BaseAgent):
     system_prompt = REVIEWER_SYSTEM_PROMPT
 
     def build_review_prompt(self, chapter_content: str, context: str = "") -> str:
-        prompt = self.system_prompt.format(chapter_content=chapter_content)
+        prompt = self.system_prompt.replace("{chapter_content}", chapter_content)
         if context:
             prompt += f"\n\n## 附加上下文\n{context}"
         return prompt

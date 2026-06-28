@@ -10,8 +10,7 @@ Usage:
 from __future__ import annotations
 from typing import Optional
 from app.graphs.state import NovelState
-from app.memory.vector_store import VectorStore
-from app.memory.memory_manager import MemoryManager
+from app.memory.memory_manager import MemoryManager, memory_manager
 from app.logger import get_logger
 import json
 
@@ -24,7 +23,7 @@ class RetrievalNode:
     Parameters
     ----------
     memory_manager : MemoryManager, optional
-        Pre-configured MemoryManager.  Creates one with default VectorStore if omitted.
+        Pre-configured MemoryManager.  Uses the global singleton if omitted.
     n_results : int
         Number of top-K memories to retrieve (default 10).
     query_builder : callable, optional
@@ -49,7 +48,7 @@ class RetrievalNode:
     @property
     def manager(self) -> MemoryManager:
         if self._manager is None:
-            self._manager = MemoryManager(VectorStore())
+            self._manager = memory_manager
         return self._manager
 
     async def __call__(self, state: NovelState) -> dict:
@@ -165,32 +164,3 @@ class RetrievalNode:
                 })
         return flat
 
-
-class ContextInjectionNode(RetrievalNode):
-    """Extended RetrievalNode that injects results directly into the writing context.
-
-    Instead of returning raw memory lists, this node formats retrieved
-    memories as a ready-to-use prompt context string under ``_memory_context``.
-    """
-
-    async def __call__(self, state: NovelState) -> dict:
-        result = await super().__call__(state)
-        memories = result.get("_retrieved_memories", [])
-
-        if not memories:
-            result["_memory_context"] = "无相关历史记忆"
-            return result
-
-        lines = ["## 相关历史记忆（自动检索）"]
-        for i, mem in enumerate(memories, 1):
-            content = mem.get("content", "")
-            meta = mem.get("metadata", {})
-            mem_type = meta.get("type", "未知")
-            chapter = meta.get("chapter_index", "?")
-            lines.append(
-                f"{i}. [第{chapter}章 / {mem_type}] "
-                f"{content[:300]}{'...' if len(content) > 300 else ''}"
-            )
-
-        result["_memory_context"] = "\n".join(lines)
-        return result

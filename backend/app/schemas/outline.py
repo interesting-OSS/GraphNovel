@@ -8,7 +8,7 @@ class OutlineCreate(BaseModel):
     """Request: create an outline entry."""
     project_id: str = Field(..., description="所属项目ID")
     volume: int = Field(1, ge=1, description="卷号")
-    chapter_num: int = Field(1, ge=1, description="章序号")
+    chapter_index: int = Field(1, ge=1, description="章序号")
     title: str = Field("新章节", min_length=1, max_length=500, description="章节标题")
     summary: str = Field("", description="章节摘要")
     key_points: str = Field("", description="关键情节要点")
@@ -24,7 +24,7 @@ class OutlineUpdate(BaseModel):
     summary: Optional[str] = None
     key_points: Optional[str] = None
     volume: Optional[int] = Field(None, ge=1)
-    chapter_num: Optional[int] = Field(None, ge=1)
+    chapter_index: Optional[int] = Field(None, ge=1)
     mode: Optional[Literal["one-to-one", "one-to-many"]] = None
     expansion_strategy: Optional[Literal["balanced", "climax", "detail"]] = None
     target_words: Optional[int] = Field(None, ge=100)
@@ -37,7 +37,7 @@ class OutlineResponse(BaseModel):
     project_id: str
     parent_id: Optional[str] = None
     volume: int
-    chapter_num: int
+    chapter_index: int
     title: str
     summary: Optional[str] = None
     key_points: Optional[str] = None
@@ -58,4 +58,4 @@ class OutlineListResponse(BaseModel):
 
 class OutlineReorderRequest(BaseModel):
     """Request: reorder outlines."""
-    items: list[dict] = Field(..., description="[{\"id\": \"...\", \"chapter_num\": 1, \"volume\": 1}]")
+    items: list[dict] = Field(..., description='[{"id": "...", "chapter_index": 1, "volume": 1}]')

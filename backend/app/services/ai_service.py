@@ -33,7 +33,7 @@ _MULTIMODAL_PROVIDERS = {"qwen"}
 # Model lists per provider
 PROVIDER_MODELS = {
     "openai":    ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o1-preview", "o1-mini"],
-    "deepseek":  ["deepseek-chat", "deepseek-reasoner", "deepseek-v3"],
+    "deepseek":  ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"],
     "qwen":      ["qwen-turbo", "qwen-plus", "qwen-max", "qwen-vl-max", "qwen-vl-plus"],
     "kimi":      ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k", "kimi-latest"],
     "anthropic": ["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5"],
@@ -68,11 +68,11 @@ class AIService:
         max_tokens: int = 32000,
     ):
         # Resolve actual provider name
-        raw_provider = (provider or settings.default_ai_provider).lower().strip()
+        raw_provider = (provider or settings.default_llm_provider).lower().strip()
         self.provider = raw_provider
         self.api_key = api_key
         self.base_url = base_url or DEFAULT_BASE_URLS.get(raw_provider)
-        self.model_name = model or settings.default_ai_model
+        self.llm_model = model or settings.default_llm_model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self._model: Optional[BaseChatModel] = None
@@ -108,10 +108,13 @@ class AIService:
 
         if self.provider in _OPENAI_COMPATIBLE:
             kwargs = {
-                "model": self.model_name,
+                "model": self.llm_model,
                 "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
                 "api_key": api_key,
+                "timeout": 120,            # 单次请求超时 120 秒
+                "max_retries": 1,          # 失败重试 1 次
+                "streaming": True,         # 启用流式，astream_events 可实时捕获 token
             }
             if base_url:
                 kwargs["base_url"] = base_url
@@ -119,7 +122,7 @@ class AIService:
 
         elif self.provider == "anthropic":
             kwargs = {
-                "model": self.model_name,
+                "model": self.llm_model,
                 "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
                 "api_key": api_key,
@@ -130,7 +133,7 @@ class AIService:
 
         elif self.provider == "gemini":
             kwargs = {
-                "model": self.model_name,
+                "model": self.llm_model,
                 "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
                 "google_api_key": api_key,
@@ -140,10 +143,12 @@ class AIService:
         else:
             # Fallback: try as OpenAI-compatible
             kwargs = {
-                "model": self.model_name or "gpt-4o",
+                "model": self.llm_model or "gpt-4o",
                 "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
                 "api_key": api_key,
+                "timeout": 120,
+                "max_retries": 1,
             }
             if base_url:
                 kwargs["base_url"] = base_url

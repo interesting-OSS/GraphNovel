@@ -1,10 +1,11 @@
-"""Career API routes — CRUD for career/level systems with AI generation."""
+"""Career API routes — CRUD for career/level systems with AI generation via graph."""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
 from app.models.relationship import Career
-from app.services.ai_service import create_ai_service
+from app.graphs.state import NovelState
+from app.graphs.utils import get_gen_config
 from app.config import settings
 from app.logger import get_logger
 import json
@@ -20,7 +21,8 @@ async def list_careers(project_id: str, db: AsyncSession = Depends(get_db)):
     careers = result.scalars().all()
     return {
         "items": [{
-            "id": c.id, "name": c.name, "description": c.description,
+            "id": c.id, "name": c.name, "career_type": c.career_type,
+            "description": c.description,
             "levels": json.loads(c.levels) if c.levels else [],
         } for c in careers],
         "total": len(careers),
@@ -35,7 +37,8 @@ async def get_career(career_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Career not found")
     return {
         "id": career.id, "project_id": career.project_id,
-        "name": career.name, "description": career.description,
+        "name": career.name, "career_type": career.career_type,
+        "description": career.description,
         "levels": json.loads(career.levels) if career.levels else [],
     }
 
@@ -45,6 +48,7 @@ async def create_career(data: dict, db: AsyncSession = Depends(get_db)):
     career = Career(
         project_id=data.get("project_id", ""),
         name=data.get("name", "新职业"),
+        career_type=data.get("career_type", "主要职业"),
         description=data.get("description", ""),
         levels=json.dumps(data.get("levels", []), ensure_ascii=False) if data.get("levels") else None,
     )
@@ -62,6 +66,8 @@ async def update_career(career_id: str, data: dict, db: AsyncSession = Depends(g
         raise HTTPException(status_code=404, detail="Career not found")
     if "name" in data:
         career.name = data["name"]
+    if "career_type" in data:
+        career.career_type = data["career_type"]
     if "description" in data:
         career.description = data["description"]
     if "levels" in data:
@@ -83,23 +89,19 @@ async def delete_career(career_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.post("/generate")
 async def generate_career(data: dict):
-    """Generate a career system via AI."""
-    ai = create_ai_service(
-        provider=data.get("provider", "openai"),
-        api_key=data.get("api_key"),
-        model=data.get("model", settings.default_ai_model),
-        temperature=0.7, max_tokens=8000,
-    )
-    prompt = f"""小说类型：{data.get('genre', '玄幻')}
-力量体系：{data.get('power_system', '未设定')}
+    """Generate career systems via the graph's career_manage_node."""
+    from app.graphs.main_graph import career_manage_node
 
-请设计一个职业等级体系，包含5-10个递进等级。以JSON格式输出：
-{{"name": "职业名", "description": "描述(50-100字)", "levels": [{{"name": "等级名", "index": 1, "description": "描述", "abilities": ["能力"]}}]}}
-只输出JSON。"""
+    state = NovelState(
+        project_id=data.get("project_id", ""),
+        genre=data.get("genre", "玄幻"),
+        world_setting=data.get("world_setting", {}),
+        generation_config=get_gen_config(data, max_tokens=8000),
+    )
 
     try:
-        result = await ai.generate_json("你是一位职业体系设计师。只输出JSON。", prompt)
-        return {"status": "completed", "career": result}
+        result = await career_manage_node(state)
+        return {"status": "completed", "careers": result.get("careers", [])}
     except Exception as e:
         logger.error("Career generation failed: %s", e)
         return {"status": "failed", "error": str(e)}

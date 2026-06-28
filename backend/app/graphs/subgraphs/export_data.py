@@ -25,7 +25,7 @@ async def export_full_project(state: NovelState) -> dict:
         "organizations": state.get("organizations", []),
         "careers": state.get("careers", []),
         "chapters": [
-            {"index": ch.get("index", i), "title": ch.get("title", ""),
+            {"chapter_index": ch.get("chapter_index", i), "title": ch.get("title", ""),
              "content": ch.get("content", ""), "word_count": ch.get("word_count", 0)}
             for i, ch in enumerate(state.get("chapters", []))
         ],

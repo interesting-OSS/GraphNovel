@@ -4,6 +4,7 @@ from langgraph.graph import StateGraph, END
 from app.graphs.state import NovelState
 from app.services.ai_service import create_ai_service
 from app.config import settings
+import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -13,17 +14,7 @@ CHAR_GEN_SYSTEM = """你是一位专业的角色设计师，擅长为小说创�
 请根据小说设定生成角色信息，以JSON格式输出。"""
 
 
-def _get_ai_service(state: NovelState, **overrides):
-    config = state.get("generation_config", {})
-    return create_ai_service(
-        provider=overrides.pop("provider", config.get("provider", "openai")),
-        api_key=overrides.pop("api_key", config.get("api_key", None)),
-        base_url=overrides.pop("base_url", config.get("base_url", None)),
-        model=overrides.pop("model", config.get("model", settings.default_ai_model)),
-        temperature=overrides.pop("temperature", config.get("temperature", 0.8)),
-        max_tokens=overrides.pop("max_tokens", config.get("max_tokens", 16000)),
-        **overrides,
-    )
+from app.graphs.utils import get_ai_service as _get_ai_service
 
 
 def _get_world_context(state: NovelState) -> str:
@@ -39,7 +30,7 @@ def _get_world_context(state: NovelState) -> str:
 
 async def generate_protagonist(state: NovelState) -> dict:
     """Generate the protagonist based on story setting."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.8, max_tokens=16000)
     genre = state.get("genre", "玄幻")
     title = state.get("title", "")
     description = state.get("description", "")
@@ -80,6 +71,13 @@ async def generate_protagonist(state: NovelState) -> dict:
         characters = state.get("characters", [])
         characters = [c for c in characters if c.get("role_type") != "protagonist"]
         characters.append(result)
+
+        # Sync to DB
+        project_id = state.get("project_id", "")
+        if project_id:
+            from app.graphs.graph_db_sync import sync_characters
+            await sync_characters(project_id, characters)
+
         return {"characters": characters, "current_phase": "protagonist_generated"}
     except Exception as e:
         logger.error("generate_protagonist failed: %s", e)
@@ -88,7 +86,7 @@ async def generate_protagonist(state: NovelState) -> dict:
 
 async def generate_supporting(state: NovelState) -> dict:
     """Generate supporting characters."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.8, max_tokens=16000)
     genre = state.get("genre", "玄幻")
     title = state.get("title", "")
     world_context = _get_world_context(state)
@@ -133,6 +131,13 @@ async def generate_supporting(state: NovelState) -> dict:
             char.setdefault("id", f"char_{existing_count + i + 1}")
             char.setdefault("role_type", "supporting")
         characters.extend(result)
+
+        # Sync to DB
+        project_id = state.get("project_id", "")
+        if project_id:
+            from app.graphs.graph_db_sync import sync_characters
+            await sync_characters(project_id, characters)
+
         return {"characters": characters, "current_phase": "supporting_generated"}
     except Exception as e:
         logger.error("generate_supporting failed: %s", e)
@@ -141,7 +146,7 @@ async def generate_supporting(state: NovelState) -> dict:
 
 async def generate_antagonist(state: NovelState) -> dict:
     """Generate the antagonist."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.8, max_tokens=16000)
     genre = state.get("genre", "玄幻")
     title = state.get("title", "")
     world_context = _get_world_context(state)
@@ -189,6 +194,13 @@ async def generate_antagonist(state: NovelState) -> dict:
         for char in result:
             char.setdefault("role_type", "antagonist")
         characters.extend(result)
+
+        # Sync to DB
+        project_id = state.get("project_id", "")
+        if project_id:
+            from app.graphs.graph_db_sync import sync_characters
+            await sync_characters(project_id, characters)
+
         return {"characters": characters, "current_phase": "antagonist_generated"}
     except Exception as e:
         logger.error("generate_antagonist failed: %s", e)
@@ -197,7 +209,7 @@ async def generate_antagonist(state: NovelState) -> dict:
 
 async def assign_career(state: NovelState) -> dict:
     """Assign careers and power levels to characters."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.8, max_tokens=16000)
     characters = state.get("characters", [])
     careers = state.get("careers", [])
 
@@ -239,7 +251,7 @@ async def assign_career(state: NovelState) -> dict:
 
 async def assign_organization(state: NovelState) -> dict:
     """Assign characters to organizations/factions."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.8, max_tokens=16000)
     characters = state.get("characters", [])
     organizations = state.get("organizations", [])
 
@@ -276,9 +288,12 @@ async def assign_organization(state: NovelState) -> dict:
         return {"current_phase": "organizations_assigned", "error": str(e)}
 
 
+MAX_FIX_ATTEMPTS = 3
+
+
 async def check_ooc(state: NovelState) -> dict:
     """Check all characters for out-of-character consistency."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.8, max_tokens=16000)
     characters = state.get("characters", [])
     world = _get_world_context(state)
 
@@ -319,29 +334,233 @@ async def check_ooc(state: NovelState) -> dict:
 
     try:
         result = await ai.generate_json("你是一位严格的角色一致性审查员。只输出JSON。", prompt)
-        has_issues = result.get("has_issues", False)
         issues = result.get("issues", [])
         if issues:
             logger.warning("OOC check found %d issues: %s", len(issues), issues)
-        return {"current_phase": "ooc_checked",
-                "human_feedback": "; ".join(issues) if issues else None}
+        else:
+            # Sync characters to DB if no issues
+            project_id = state.get("project_id", "")
+            characters = state.get("characters", [])
+            if project_id and characters:
+                from app.graphs.graph_db_sync import sync_characters
+                await sync_characters(project_id, characters)
+
+        return {
+            "current_phase": "ooc_checked",
+            "_ooc_check": result,
+        }
     except Exception as e:
         logger.error("check_ooc failed: %s", e)
         return {"current_phase": "ooc_checked", "error": str(e)}
 
 
-def route_after_check(state: NovelState) -> Literal["done", "fix_issues"]:
-    feedback = state.get("human_feedback", "")
-    if feedback and state.get("current_phase") == "ooc_checked":
-        return "fix_issues"
+def route_after_check(state: NovelState) -> Literal["fix_character_issues", "done"]:
+    """Route to fix if OOC issues found and retries remain."""
+    ooc = state.get("_ooc_check", {})
+    has_issues = ooc.get("has_issues", False)
+    attempts = state.get("_fix_attempts", 0)
+
+    if has_issues and attempts < MAX_FIX_ATTEMPTS:
+        return "fix_character_issues"
     return "done"
+
+
+async def fix_character_issues(state: NovelState) -> dict:
+    """Targeted fix: only revise characters that have OOC problems."""
+    ai = _get_ai_service(state, temperature=0.8, max_tokens=16000)
+    characters = state.get("characters", [])
+    ooc = state.get("_ooc_check", {})
+    issues = ooc.get("issues", [])
+    suggestions = ooc.get("suggestions", [])
+    attempts = state.get("_fix_attempts", 0)
+    world = _get_world_context(state)
+
+    logger.info(
+        "Fixing character issues — attempt %d/%d. Issues: %s",
+        attempts + 1, MAX_FIX_ATTEMPTS, issues,
+    )
+
+    char_list = json.dumps(
+        [{k: v for k, v in c.items() if k != "color"} for c in characters],
+        ensure_ascii=False, indent=2,
+    )
+
+    prompt = f"""世界观摘要：{world}
+
+当前角色列表：
+{char_list}
+
+## 发现的问题
+{json.dumps(issues, ensure_ascii=False, indent=2)}
+
+## 改进建议
+{json.dumps(suggestions, ensure_ascii=False, indent=2)}
+
+请只修改存在问题的角色，以JSON数组格式输出（输出完整的角色对象，包含所有字段）：
+```json
+[
+  {{
+    "name": "被修改的角色名",
+    "gender": "...",
+    "age": ...,
+    "role_type": "...",
+    "appearance": "...",
+    "personality": "...",
+    "background": "...",
+    "goals": "...",
+    "secrets": "...",
+    "mental_state": "...",
+    "power_level": "...",
+    "location": "...",
+    "motto": "...",
+    "career_id": "...",
+    "career_level": "...",
+    "org_id": "...",
+    "org_position": "..."
+  }}
+]
+```
+
+注意：
+1. 只输出需要修改的角色，没问题的角色不要输出
+2. 角色名用于匹配，不要改名
+3. 修改后性格与职业/地位必须匹配
+4. 能力须符合世界观设定
+5. 只输出JSON数组"""
+
+    try:
+        result = await ai.generate_json(
+            system_prompt="你是一位角色设计师，擅长修复角色设定中的问题。只输出JSON数组。",
+            user_prompt=prompt,
+            max_retries=3,
+        )
+        if isinstance(result, dict):
+            result = [result]
+
+        # Merge: overwrite characters by name
+        fix_map = {c.get("name", ""): c for c in result if c.get("name")}
+        for i, char in enumerate(characters):
+            name = char.get("name", "")
+            if name in fix_map:
+                # 保留原有 id，只更新内容
+                replacement = fix_map[name]
+                replacement["id"] = char.get("id", replacement.get("id", ""))
+                replacement["role_type"] = char.get("role_type", replacement.get("role_type", ""))
+                characters[i] = replacement
+
+        return {
+            "characters": characters,
+            "current_phase": "character_issues_fixed",
+            "_fix_attempts": attempts + 1,
+            "_fix_history": state.get("_fix_history", []) + [{
+                "attempt": attempts + 1,
+                "issues": issues,
+                "fixed_characters": list(fix_map.keys()),
+            }],
+        }
+    except Exception as e:
+        logger.error("fix_character_issues failed: %s", e)
+        # Sync what we have on failure
+        project_id = state.get("project_id", "")
+        if project_id:
+            from app.graphs.graph_db_sync import sync_characters
+            await sync_characters(project_id, state.get("characters", []))
+        return {
+            "current_phase": "character_issues_fixed",
+            "_fix_attempts": MAX_FIX_ATTEMPTS,  # 失败则放弃重试
+            "error": str(e),
+        }
+
+
+async def generate_relationships(state: NovelState) -> dict:
+    """Generate character relationships based on generated characters."""
+    ai = _get_ai_service(state, temperature=0.7)
+    characters = state.get("characters", [])
+    project_id = state.get("project_id", "unknown")
+
+    if len(characters) < 2:
+        logger.info("Too few characters for relationships, skipping")
+        return {"current_phase": "relationships_generated"}
+
+    char_summaries = "\n".join(
+        f"- {c.get('name', '?')}（{c.get('role_type', 'supporting')}）：{c.get('personality', '')[:80]}"
+        for c in characters
+    )
+
+    prompt = f"""已有角色：
+{char_summaries}
+
+请为以上角色设计关系网络，以JSON数组格式输出：
+```json
+[
+  {{
+    "char_a": "角色A名字",
+    "char_b": "角色B名字",
+    "relation_type": "师徒/敌对/同盟/暗恋/挚友/血亲/仇敌/搭档/其他",
+    "description": "关系描述（20-50字）",
+    "intimacy": 70
+  }}
+]
+```
+
+要求：
+1. 每个主要角色至少与2个其他角色有关系
+2. 关系类型多样化，包含正面和负面关系
+3. intimacy范围0-100（0=死敌，50=普通，100=至亲）
+4. 至少生成{len(characters)}条关系
+只输出JSON数组。"""
+
+    try:
+        result = await ai.generate_json("你是一位角色关系设计师。只输出JSON数组。", prompt)
+        if isinstance(result, dict):
+            result = [result]
+
+        # Build relationship list with character ID resolution
+        name_to_id = {}
+        for c in characters:
+            name_to_id[c.get("name", "")] = c.get("id", "")
+
+        relationships = []
+        for rel in (result if isinstance(result, list) else []):
+            char_a_name = rel.get("char_a", rel.get("char_a_name", ""))
+            char_b_name = rel.get("char_b", rel.get("char_b_name", ""))
+            relationships.append({
+                "char_a_id": name_to_id.get(char_a_name, char_a_name),
+                "char_b_id": name_to_id.get(char_b_name, char_b_name),
+                "char_a_name": char_a_name,
+                "char_b_name": char_b_name,
+                "relation_type": rel.get("relation_type", "其他"),
+                "description": rel.get("description", ""),
+                "intimacy": float(rel.get("intimacy", 50)),
+                "status": "正常",
+            })
+
+        # Sync to DB
+        from app.graphs.graph_db_sync import sync_relationships
+        await sync_relationships(project_id, relationships)
+
+        logger.info("Generated %d relationships for %d characters", len(relationships), len(characters))
+        return {
+            "character_relationships": relationships,
+            "current_phase": "relationships_generated",
+        }
+    except Exception as e:
+        logger.error("generate_relationships failed: %s", e)
+        return {"current_phase": "relationships_generated", "error": str(e)}
+
+
+def route_after_fix(state: NovelState) -> Literal["check_ooc"]:
+    """After fixing, loop back to re-check OOC."""
+    return "check_ooc"
 
 
 def create_char_create_subgraph():
     """Create the Character Creation subgraph.
 
     Generates characters in order:
-        protagonist → supporting → antagonist → assign_career → assign_organization → check_ooc
+        protagonist → supporting → antagonist → assign_career → assign_organization
+        → generate_relationships → check_ooc
+        → [fix_character_issues → re-check (max 3 rounds), or done]
     """
     builder = StateGraph(NovelState)
 
@@ -350,14 +569,30 @@ def create_char_create_subgraph():
     builder.add_node("generate_antagonist", generate_antagonist)
     builder.add_node("assign_career", assign_career)
     builder.add_node("assign_organization", assign_organization)
+    builder.add_node("generate_relationships", generate_relationships)
     builder.add_node("check_ooc", check_ooc)
+    builder.add_node("fix_character_issues", fix_character_issues)
 
     builder.set_entry_point("generate_protagonist")
     builder.add_edge("generate_protagonist", "generate_supporting")
     builder.add_edge("generate_supporting", "generate_antagonist")
     builder.add_edge("generate_antagonist", "assign_career")
     builder.add_edge("assign_career", "assign_organization")
-    builder.add_edge("assign_organization", "check_ooc")
-    builder.add_conditional_edges("check_ooc", route_after_check, {"done": END, "fix_issues": "generate_protagonist"})
+    builder.add_edge("assign_organization", "generate_relationships")
+    builder.add_edge("generate_relationships", "check_ooc")
+
+    # check_ooc → fix_character_issues (loop) or done (exit)
+    builder.add_conditional_edges(
+        "check_ooc",
+        route_after_check,
+        {"fix_character_issues": "fix_character_issues", "done": END}
+    )
+
+    # fix_character_issues → back to check_ooc for re-verification
+    builder.add_conditional_edges(
+        "fix_character_issues",
+        route_after_fix,
+        {"check_ooc": "check_ooc"}
+    )
 
     return builder.compile()

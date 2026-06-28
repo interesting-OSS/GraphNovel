@@ -7,8 +7,8 @@ from datetime import datetime
 class RelationshipCreate(BaseModel):
     """Request: create a character relationship."""
     project_id: str = Field(..., description="所属项目ID")
-    char_a: str = Field(..., description="角色A ID")
-    char_b: str = Field(..., description="角色B ID")
+    char_a_id: str = Field(..., description="角色A ID")
+    char_b_id: str = Field(..., description="角色B ID")
     relation_type: str = Field("其他", description="关系类型")
     description: str = Field("", description="关系描述")
     intimacy: int = Field(50, ge=0, le=100, description="亲密度 0-100")
@@ -18,8 +18,8 @@ class RelationshipCreate(BaseModel):
 
 class RelationshipUpdate(BaseModel):
     """Request: update a relationship."""
-    char_a: Optional[str] = None
-    char_b: Optional[str] = None
+    char_a_id: Optional[str] = None
+    char_b_id: Optional[str] = None
     relation_type: Optional[str] = None
     description: Optional[str] = None
     intimacy: Optional[int] = Field(None, ge=0, le=100)
@@ -30,8 +30,8 @@ class RelationshipResponse(BaseModel):
     """Response: relationship details."""
     id: str
     project_id: str
-    char_a: str
-    char_b: str
+    char_a_id: str
+    char_b_id: str
     relation_type: str
     description: Optional[str] = None
     intimacy: int

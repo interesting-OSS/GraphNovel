@@ -1,0 +1,32 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort (import order)
+    "N",   # pep8-naming
+    "W",   # pycodestyle warnings
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "ARG", # flake8-unused-arguments
+    "C4",  # flake8-comprehensions
+    "T100",# flake8-debugger (ban pdb)
+]
+ignore = ["ARG001", "ARG002"]  # Allow unused args in interface methods
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests (need DB)",
+    "ai: marks tests that call AI API (use mock in CI)",
+]

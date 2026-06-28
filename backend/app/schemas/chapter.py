@@ -37,7 +37,7 @@ class ChapterResponse(BaseModel):
     id: str
     project_id: str
     outline_id: Optional[str] = None
-    index: int
+    chapter_index: int
     title: str
     content: Optional[str] = None
     word_count: int

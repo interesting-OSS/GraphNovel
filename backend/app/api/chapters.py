@@ -2,30 +2,78 @@
 
 Powered by LangGraph subgraphs: chapter_write, chapter_analyze, review, batch_gen.
 """
-import json
 import asyncio
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from langgraph.checkpoint.memory import MemorySaver
 
 from app.database import get_db
-from app.utils.sse_response import SSEResponse, create_sse_response
+from app.utils.sse_response import SSEResponse
 from app.graphs.state import create_initial_state, NovelState
-from app.graphs.main_graph import create_novel_graph
 from app.graphs.subgraphs.chapter_write import create_chapter_write_subgraph
 from app.graphs.subgraphs.chapter_analyze import create_chapter_analyze_subgraph
-from app.services.ai_service import create_ai_service
 from app.services.task_service import task_service
+from app.graphs.utils import get_gen_config
+from app.services.ai_service import create_ai_service
 from app.config import settings
 from app.logger import get_logger
 from app.models.chapter import Chapter
-from app.models.project import Project
 from sqlalchemy import select
 
 router = APIRouter(prefix="/chapters", tags=["chapters"])
 logger = get_logger(__name__)
+
+
+async def _auto_extract_foreshadows(project_id: str, chapter_index: int, content: str, ai_config: dict) -> int:
+    """Auto-detect foreshadows from chapter content and save to DB. Returns count added."""
+    if not content or len(content) < 100:
+        return 0
+    try:
+        ai = create_ai_service(
+            provider=ai_config.get("provider", "openai"),
+            api_key=ai_config.get("api_key"),
+            base_url=ai_config.get("base_url"),
+            model=ai_config.get("model", settings.default_llm_model),
+            temperature=0.3, max_tokens=2000,
+        )
+        prompt = f"""请从以下章节中识别伏笔和钩子，以JSON格式输出：
+```json
+{{
+  "new_foreshadows": [
+    {{"description": "伏笔描述", "category": "人物伏笔/情节伏笔/世界观伏笔/能力伏笔", "importance": 7}}
+  ]
+}}
+```
+
+章节内容：
+{content[:6000]}"""
+        result = await ai.generate_json("你是一位小说分析师，善于识别伏笔。只输出JSON。", prompt)
+        new_items = result.get("new_foreshadows", [])
+        if not new_items:
+            return 0
+
+        from app.database import async_session_factory
+        from app.models.foreshadow import Foreshadow
+        async with async_session_factory() as db:
+            count = 0
+            for fs in new_items:
+                foreshadow = Foreshadow(
+                    project_id=project_id,
+                    description=fs.get("description", ""),
+                    category=fs.get("category", "情节伏笔"),
+                    importance=float(fs.get("importance", 5)),
+                    status="set",
+                    set_chapter_id=None,
+                    target_chapter_index=chapter_index,
+                )
+                db.add(foreshadow)
+                count += 1
+            await db.commit()
+        logger.info("Auto-extracted %d foreshadows for ch%d", count, chapter_index)
+        return count
+    except Exception as e:
+        logger.warning("Auto foreshadow extraction skipped: %s", e)
+        return 0
 
 
 def _parse_state(data: dict) -> dict:
@@ -49,14 +97,7 @@ def _parse_state(data: dict) -> dict:
         "writing_style_id": data.get("writing_style_id"),
         "active_skill": data.get("active_skill"),
         "human_feedback": data.get("human_feedback"),
-        "generation_config": {
-            "provider": config.get("provider", "openai"),
-            "model": config.get("model", settings.default_ai_model),
-            "temperature": config.get("temperature", 0.7),
-            "max_tokens": config.get("max_tokens", 32000),
-            "api_key": config.get("api_key"),
-            "base_url": config.get("base_url"),
-        },
+        "generation_config": get_gen_config(config),
     }
 
 
@@ -71,8 +112,9 @@ async def list_chapters(project_id: str, db: AsyncSession = Depends(get_db)):
     )
     chapters = result.scalars().all()
     return {
-        "items": [{"id": c.id, "index": c.chapter_index, "title": c.title,
-                    "word_count": c.word_count, "status": c.status} for c in chapters],
+        "items": [{"id": c.id, "chapter_index": c.chapter_index, "title": c.title,
+                    "content": c.content, "word_count": c.word_count,
+                    "status": c.status} for c in chapters],
         "total": len(chapters),
     }
 
@@ -85,7 +127,7 @@ async def get_chapter(chapter_id: str, db: AsyncSession = Depends(get_db)):
     if not chapter:
         raise HTTPException(status_code=404, detail="Chapter not found")
     return {
-        "id": chapter.id, "index": chapter.chapter_index, "title": chapter.title,
+        "id": chapter.id, "chapter_index": chapter.chapter_index, "title": chapter.title,
         "content": chapter.content, "word_count": chapter.word_count,
         "status": chapter.status, "project_id": chapter.project_id,
     }
@@ -142,10 +184,12 @@ async def delete_chapter(chapter_id: str, db: AsyncSession = Depends(get_db)):
 async def generate_chapter_stream(chapter_id: str, data: dict):
     """Generate chapter content via LangGraph ChapterWrite subgraph with SSE streaming."""
     async def event_generator():
+        from app.services.generation_tracker import tracker as gen_tracker
         try:
             state_dict = _parse_state(data)
+            project_id = state_dict.get("project_id", chapter_id)
             state = create_initial_state(
-                project_id=state_dict.get("project_id", ""),
+                project_id=project_id,
                 title=state_dict.get("title", ""),
                 genre=state_dict.get("genre", "玄幻"),
             )
@@ -153,37 +197,87 @@ async def generate_chapter_stream(chapter_id: str, data: dict):
                 if key in state:
                     state[key] = value
 
+            gen_tracker.start(project_id, "chapter_write", "章节写作")
+            gen_tracker.update(project_id, phase="preparing", label="准备写作上下文...", progress=5.0)
             yield SSEResponse.progress("准备写作上下文...", 5.0, "preparing")
 
             # Run the chapter write subgraph
             subgraph = create_chapter_write_subgraph()
             config_ctx = {"configurable": {"thread_id": f"chapter_gen_{chapter_id}"}}
 
-            # Stream through subgraph nodes
-            async for event in subgraph.astream(state, config_ctx):
-                for node_name, node_output in event.items():
-                    if node_name == "build_context":
-                        yield SSEResponse.progress("正在构建写作上下文...", 15.0, "preparing")
-                    elif node_name == "generate_draft":
-                        yield SSEResponse.progress("正在生成章节内容...", 30.0, "generating")
-                        # If the node output contains actual chapter content, stream it
-                        chapters = node_output.get("chapters", [])
-                        for ch in chapters:
-                            content = ch.get("content", "")
-                            if content:
-                                # Stream content in chunks for real-time display
-                                chunk_size = 100
-                                for i in range(0, len(content), chunk_size):
-                                    yield SSEResponse.chunk(content[i:i + chunk_size])
-                                    await asyncio.sleep(0.01)
-                    elif node_name == "save_generation_history":
-                        yield SSEResponse.progress("保存生成版本...", 95.0, "saving")
+            # Use astream_events to capture LLM streaming tokens in real-time
+            chapters = []
+            content_buffer = ""
+            node_phase = "preparing"
+            try:
+                async for event in subgraph.astream_events(state, config_ctx, version="v2"):
+                    event_type = event.get("event", "")
 
-            # Get final state
-            final_state = await subgraph.aget_state(config_ctx)
-            final_values = final_state.values if final_state else {}
-            chapters = final_values.get("chapters", [])
+                    # ── LLM streaming tokens (real-time content) ──
+                    if event_type == "on_chat_model_stream":
+                        chunk_data = event.get("data", {}).get("chunk")
+                        if chunk_data and hasattr(chunk_data, "content") and chunk_data.content:
+                            token = chunk_data.content
+                            content_buffer += token
+                            yield SSEResponse.chunk(token)
+                            # Update progress smoothly from 30→80 during streaming
+                            if len(content_buffer) % 200 == 0:
+                                progress = min(30 + (len(content_buffer) / 200) * 0.5, 79)
+                                yield SSEResponse.progress("正在生成章节内容...", progress, "generating")
 
+                    # ── Node lifecycle events ──
+                    elif event_type == "on_chain_start":
+                        node_name = event.get("name", "")
+                        if node_name == "build_context":
+                            node_phase = "preparing"
+                            gen_tracker.update(project_id, phase="preparing", label="正在构建写作上下文...", progress=15.0)
+                            yield SSEResponse.progress("正在构建写作上下文...", 15.0, "preparing")
+                        elif node_name == "generate_draft":
+                            node_phase = "generating"
+                            content_buffer = ""
+                            gen_tracker.update(project_id, phase="generating", label="正在生成章节内容...", progress=30.0)
+                            yield SSEResponse.progress("正在生成章节内容...", 30.0, "generating")
+                        elif node_name == "save_generation_history":
+                            node_phase = "saving"
+                            gen_tracker.update(project_id, phase="saving", label="保存生成版本...", progress=85.0)
+                            yield SSEResponse.progress("保存生成版本...", 85.0, "saving")
+
+                    elif event_type == "on_chain_end":
+                        node_name = event.get("name", "")
+                        output = event.get("data", {}).get("output", {})
+                        if node_name == "generate_draft" and isinstance(output, dict):
+                            chapters = output.get("chapters", [])
+                        if node_name == "generate_draft" and node_phase == "generating":
+                            yield SSEResponse.progress("内容生成完成，保存中...", 82.0, "generating")
+                        if node_name == "__interrupt__":
+                            pass  # Human review interrupt — draft already generated
+
+            except Exception as stream_err:
+                err_name = type(stream_err).__name__
+                if "Interrupt" not in err_name and "interrupt" not in str(stream_err).lower():
+                    raise
+
+            # Fallback: get final state
+            if not chapters:
+                try:
+                    final_state = await subgraph.aget_state(config_ctx)
+                    final_values = final_state.values if final_state else {}
+                    chapters = final_values.get("chapters", [])
+                except Exception:
+                    pass
+
+            # Auto-detect foreshadows from generated content
+            cfg = get_gen_config(data)
+            gen_chapter = chapters[0] if chapters else {}
+            gen_content = gen_chapter.get("content", "")
+            gen_idx = gen_chapter.get("chapter_index", 0)
+            if gen_content:
+                yield SSEResponse.progress("正在检测伏笔...", 92.0, "analyzing")
+                fs_count = await _auto_extract_foreshadows(project_id, gen_idx, gen_content, cfg)
+                if fs_count > 0:
+                    yield SSEResponse.progress(f"检测到 {fs_count} 个伏笔", 95.0, "analyzing")
+
+            gen_tracker.finish(project_id)
             yield SSEResponse.progress("生成完成", 100.0, "complete")
             yield SSEResponse.result({"chapters": chapters})
             yield SSEResponse.done("章节生成完成")
@@ -214,12 +308,12 @@ async def analyze_chapter(chapter_id: str, data: dict, db: AsyncSession = Depend
 
         result = await subgraph.ainvoke(state, config_ctx)
         chapter_analyses = result.get("chapter_analyses", [])
-        idx = result.get("current_chapter_index", 0)
+        chapter_index = result.get("current_chapter_index", 0)
 
         # Find the relevant analysis
         analysis = {}
         for a in chapter_analyses:
-            if a.get("chapter_index") == idx:
+            if a.get("chapter_index") == chapter_index:
                 analysis = a
                 break
 
@@ -231,37 +325,51 @@ async def analyze_chapter(chapter_id: str, data: dict, db: AsyncSession = Depend
 
 @router.post("/{chapter_id}/polish")
 async def polish_chapter(chapter_id: str, data: dict):
-    """Polish chapter prose via SSE streaming."""
+    """Polish chapter prose via streaming AI, with real-time token output."""
     async def event_generator():
         try:
-            ai = create_ai_service(
-                provider=data.get("provider", "openai"),
-                api_key=data.get("api_key"),
-                model=data.get("model", settings.default_ai_model),
-                temperature=0.5,
-                max_tokens=32000,
-            )
             content = data.get("content", "")
             if not content:
                 yield SSEResponse.error("无章节内容")
                 return
 
-            yield SSEResponse.progress("正在润色...", 20.0, "polishing")
+            yield SSEResponse.progress("正在准备润色...", 10.0, "polishing")
 
-            prompt = f"""你是一位资深小说编辑。请润色以下章节，优化语言流畅度、用词精准度、节奏把控。
-保持原文风格和情节不变，只做文笔层面的优化。
+            # Build polish prompt using EditorAgent
+            from app.agents.editor_agent import EditorAgent
+            cfg = get_gen_config(data, temperature=0.5, max_tokens=8000)
+            ai = create_ai_service(
+                provider=cfg["provider"], api_key=cfg["api_key"],
+                base_url=cfg["base_url"], model=cfg["model"],
+                temperature=cfg["temperature"], max_tokens=cfg["max_tokens"],
+            )
+            editor = EditorAgent(model=ai.model)
+            prompt = editor.build_polish_prompt(original_text=content)
 
-原文：
-{content[:15000]}
+            yield SSEResponse.progress("正在润色文本...", 30.0, "polishing")
 
-请输出润色后的完整章节："""
+            # Stream AI generation token-by-token
+            polished = ""
+            async for token in ai.generate_stream(editor.system_prompt, prompt):
+                polished += token
+                yield SSEResponse.chunk(token)
 
-            full_response = ""
-            async for chunk in ai.generate_stream("你是一位资深小说编辑。", prompt):
-                full_response += chunk
-                yield SSEResponse.chunk(chunk)
+            yield SSEResponse.progress("正在保存...", 90.0, "polishing")
 
-            yield SSEResponse.result({"polished_content": full_response})
+            # Sync polished content to DB
+            chapter_index = data.get("chapter_index", 0)
+            project_id = data.get("project_id", "")
+            if project_id:
+                from app.graphs.graph_db_sync import sync_chapter
+                await sync_chapter(project_id, {
+                    "chapter_index": chapter_index,
+                    "content": polished.strip(),
+                    "word_count": len(polished),
+                    "status": "polished",
+                })
+
+            yield SSEResponse.progress("润色完成", 100.0, "complete")
+            yield SSEResponse.result({"content": polished.strip(), "operation": "polish"})
             yield SSEResponse.done("润色完成")
 
         except Exception as e:
@@ -277,29 +385,29 @@ async def polish_chapter(chapter_id: str, data: dict):
 
 @router.post("/{chapter_id}/rewrite")
 async def rewrite_chapter(chapter_id: str, data: dict, db: AsyncSession = Depends(get_db)):
-    """Rewrite chapter based on user feedback."""
+    """Rewrite chapter based on user feedback via graph's rewrite_full node."""
     try:
-        ai = create_ai_service(
-            provider=data.get("provider", "openai"),
-            api_key=data.get("api_key"),
-            model=data.get("model", settings.default_ai_model),
-            temperature=0.7,
-            max_tokens=32000,
-        )
         content = data.get("content", "")
         feedback = data.get("feedback", "请改善")
 
-        prompt = f"""你是一位资深小说编辑。请根据反馈重写以下章节：
+        chapter_index = data.get("chapter_index", 0)
+        state = NovelState(
+            project_id=data.get("project_id", ""),
+            current_chapter_index=chapter_index,
+            human_feedback=feedback,
+            chapters=[{
+                "chapter_index": chapter_index,
+                "content": content,
+            }],
+            generation_config=get_gen_config(data),
+        )
 
-用户反馈：{feedback}
+        from app.graphs.subgraphs.chapter_write import rewrite_full
+        result = await rewrite_full(state)
+        chapters_out = result.get("chapters", [])
+        rewritten = chapters_out[0].get("content", "") if chapters_out else content
 
-原文：
-{content[:15000]}
-
-请输出重写后的完整章节："""
-
-        result = await ai.generate("你是一位专业的小说编辑。", prompt)
-        return {"rewritten_content": result.strip(), "status": "rewritten"}
+        return {"rewritten_content": rewritten, "status": "rewritten"}
     except Exception as e:
         logger.exception("Rewrite failed for %s", chapter_id)
         return {"status": "failed", "error": str(e)}
@@ -307,16 +415,9 @@ async def rewrite_chapter(chapter_id: str, data: dict, db: AsyncSession = Depend
 
 @router.post("/{chapter_id}/partial-regenerate-stream")
 async def partial_regenerate_stream(chapter_id: str, data: dict):
-    """Partial regenerate (rewrite selected text) via SSE streaming."""
+    """Partial regenerate (rewrite selected text) via graph node with SSE streaming."""
     async def event_generator():
         try:
-            ai = create_ai_service(
-                provider=data.get("provider", "openai"),
-                api_key=data.get("api_key"),
-                model=data.get("model", settings.default_ai_model),
-                temperature=0.7,
-                max_tokens=8000,
-            )
             selected_text = data.get("selected_text", "")
             strategy = data.get("strategy", "similar")
             custom_instruction = data.get("custom_instruction", "")
@@ -325,30 +426,40 @@ async def partial_regenerate_stream(chapter_id: str, data: dict):
                 yield SSEResponse.error("未选中文本")
                 return
 
-            strategy_prompts = {
+            strategy_feedback = {
                 "similar": "请保持原文风格重写以下段落。",
                 "expand": "请在保持风格的基础上扩展细节和描写。",
                 "condense": "请精简以下内容，去除冗余但保留核心信息。",
                 "custom": f"请根据以下指令重写：{custom_instruction}",
             }
-            instruction = strategy_prompts.get(strategy, strategy_prompts["similar"])
+            feedback = strategy_feedback.get(strategy, strategy_feedback["similar"])
 
             yield SSEResponse.progress("正在重写选中段落...", 30.0, "rewriting")
 
-            prompt = f"""你是一位小说编辑。
-{instruction}
+            chapter_index = data.get("chapter_index", 0)
+            state = NovelState(
+                project_id=data.get("project_id", ""),
+                current_chapter_index=chapter_index,
+                human_feedback=f"{feedback}\n\n原文段落：{selected_text[:3000]}",
+                chapters=[{
+                    "chapter_index": chapter_index,
+                    "content": selected_text,
+                }],
+                generation_config=get_gen_config(data, max_tokens=8000),
+            )
 
-原文段落：
-{selected_text[:3000]}
+            from app.graphs.subgraphs.chapter_write import rewrite_partial
+            result = await rewrite_partial(state)
+            chapters_out = result.get("chapters", [])
+            partial_result = chapters_out[0].get("content", "") if chapters_out else selected_text
 
-请输出重写后的内容："""
+            # Stream back in chunks
+            chunk_size = 100
+            for i in range(0, len(partial_result), chunk_size):
+                yield SSEResponse.chunk(partial_result[i:i + chunk_size])
+                await asyncio.sleep(0.01)
 
-            full_response = ""
-            async for chunk in ai.generate_stream("你是一位资深小说编辑。", prompt):
-                full_response += chunk
-                yield SSEResponse.chunk(chunk)
-
-            yield SSEResponse.result({"rewritten": full_response})
+            yield SSEResponse.result({"content": partial_result, "operation": "rewrite"})
             yield SSEResponse.done("部分重写完成")
 
         except Exception as e:

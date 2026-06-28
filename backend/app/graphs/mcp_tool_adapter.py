@@ -19,7 +19,7 @@ from langchain_core.tools import StructuredTool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.language_models import BaseChatModel
 
-from app.mcp.server_manager import mcp_manager
+from app.mcp.facade import mcp_client
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ def _json_schema_to_pydantic(schema: dict, model_name: str) -> Optional[type[Bas
 async def _execute_mcp_tool(server_id: str, tool_name: str, **kwargs: Any) -> str:
     """Execute an MCP tool and return its result as a string."""
     try:
-        result = await mcp_manager.call_tool(server_id, tool_name, kwargs)
+        result = await mcp_client.call_tool(server_id, tool_name, kwargs)
         if isinstance(result, str):
             return result
         return json.dumps(result, ensure_ascii=False, default=str)
@@ -149,21 +149,34 @@ def _mcp_tool_to_langchain(tool_dict: dict) -> Optional[StructuredTool]:
 async def get_available_mcp_tools() -> list[StructuredTool]:
     """Fetch all enabled MCP tools and convert them to LangChain StructuredTool instances.
 
-    Tools from unreachable servers are silently skipped.
+    Gets raw tools from the MCP facade (not OpenAI-formatted), so we retain
+    server_id/server_name metadata for routing tool calls back to the right server.
     """
-    from app.services.mcp_service import mcp_service
-
     langchain_tools: list[StructuredTool] = []
-    try:
-        all_tools = await mcp_service.list_all_tools()
-    except Exception as exc:
-        logger.warning("Failed to list MCP tools: %s", exc)
-        return langchain_tools
 
-    for tool_dict in all_tools:
-        lc_tool = _mcp_tool_to_langchain(tool_dict)
-        if lc_tool is not None:
-            langchain_tools.append(lc_tool)
+    # Collect tools from all registered sessions via the facade
+    sessions = mcp_client.get_session_stats()
+    for server_id in sessions.get("sessions", {}):
+        try:
+            raw_tools = await mcp_client.get_tools(server_id)
+        except Exception as exc:
+            logger.warning("Failed to get tools from %s: %s", server_id, exc)
+            continue
+
+        info = mcp_client._sessions.get(server_id)
+        server_name = info.plugin_name if info else server_id
+
+        for tool in raw_tools:
+            tool_with_meta = {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters", {}),
+                "server_id": server_id,
+                "server_name": server_name,
+            }
+            lc_tool = _mcp_tool_to_langchain(tool_with_meta)
+            if lc_tool is not None:
+                langchain_tools.append(lc_tool)
 
     logger.info("Loaded %d MCP tools as LangChain StructuredTools", len(langchain_tools))
     return langchain_tools

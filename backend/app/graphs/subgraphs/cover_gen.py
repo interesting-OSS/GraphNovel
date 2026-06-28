@@ -9,22 +9,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _get_ai_service(state: NovelState, **overrides):
-    config = state.get("generation_config", {})
-    return create_ai_service(
-        provider=overrides.pop("provider", config.get("provider", "openai")),
-        api_key=overrides.pop("api_key", config.get("api_key", None)),
-        base_url=overrides.pop("base_url", config.get("base_url", None)),
-        model=overrides.pop("model", config.get("model", settings.default_ai_model)),
-        temperature=overrides.pop("temperature", config.get("temperature", 0.7)),
-        max_tokens=overrides.pop("max_tokens", config.get("max_tokens", 4000)),
-        **overrides,
-    )
+from app.graphs.utils import get_ai_service as _get_ai_service
 
 
 async def generate_prompt(state: NovelState) -> dict:
     """Generate a cover image prompt from the novel's content and world setting."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, max_tokens=4000)
     title = state.get("title", "")
     description = state.get("description", "")
     genre = state.get("genre", "玄幻")

@@ -8,17 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _get_ai_service(state: NovelState, **overrides):
-    config = state.get("generation_config", {})
-    return create_ai_service(
-        provider=overrides.pop("provider", config.get("provider", "openai")),
-        api_key=overrides.pop("api_key", config.get("api_key", None)),
-        base_url=overrides.pop("base_url", config.get("base_url", None)),
-        model=overrides.pop("model", config.get("model", settings.default_ai_model)),
-        temperature=overrides.pop("temperature", config.get("temperature", 0.3)),
-        max_tokens=overrides.pop("max_tokens", config.get("max_tokens", 32000)),
-        **overrides,
-    )
+from app.graphs.utils import get_ai_service as _get_ai_service
 
 
 async def parse_file(state: NovelState) -> dict:
@@ -32,7 +22,7 @@ async def parse_file(state: NovelState) -> dict:
 
 async def detect_chapter_boundaries(state: NovelState) -> dict:
     """AI-powered chapter boundary detection from raw text."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.3)
     # The raw text would come from the parsing step via _import_raw_text in state
     raw_text = state.get("_import_raw_text", "")
     if not raw_text:
@@ -75,7 +65,7 @@ async def detect_chapter_boundaries(state: NovelState) -> dict:
 
 async def extract_characters(state: NovelState) -> dict:
     """NER + LLM character extraction from text."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.3)
     raw_text = state.get("_import_raw_text", "")
     if not raw_text:
         return {"current_phase": "characters_extracted"}
@@ -129,7 +119,7 @@ async def structure_content(state: NovelState) -> dict:
         for i, boundary in enumerate(boundaries):
             outlines.append({
                 "volume": 1,
-                "chapter_num": i + 1,
+                "chapter_index": i + 1,
                 "title": boundary.get("suggested_title", boundary.get("title", f"第{i+1}章")),
                 "summary": f"导入章节 - 起始: {boundary.get('start_marker', '未知')}",
                 "key_points": "",

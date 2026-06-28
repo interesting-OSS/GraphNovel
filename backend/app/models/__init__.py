@@ -11,7 +11,7 @@ from app.models.mcp_plugin import MCPPlugin
 from app.models.prompt_template import PromptTemplate
 from app.models.background_task import BackgroundTask
 from app.models.inspiration import Inspiration
-from app.models.settings_model import SettingsModel, APIPreset
+from app.models.user_config import SettingsModel, APIPreset
 
 __all__ = [
     "Project", "Outline", "Character", "Chapter",

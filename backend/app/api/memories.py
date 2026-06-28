@@ -4,23 +4,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
 from app.models.memory import StoryMemory, PlotAnalysis
-from app.memory.vector_store import VectorStore
-from app.memory.memory_manager import MemoryManager
+from app.memory.memory_manager import memory_manager
 from app.logger import get_logger
 
-router = APIRouter(prefix="/memories", tags=["memories"])
+router = APIRouter(prefix="/memory", tags=["memory"])
 logger = get_logger(__name__)
-
-_vector_store = None
-_memory_manager = None
-
-
-def _get_memory_manager() -> MemoryManager:
-    global _memory_manager, _vector_store
-    if _memory_manager is None:
-        _vector_store = VectorStore()
-        _memory_manager = MemoryManager(_vector_store)
-    return _memory_manager
 
 
 @router.get("/project/{project_id}")
@@ -45,17 +33,16 @@ async def list_memories(project_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/project/{project_id}/search")
-async def search_memories(project_id: str, q: str = "", layer: str = ""):
+async def search_memories(project_id: str, query: str = "", layer: str = ""):
     """Semantic search through vector memories."""
-    if not q:
+    if not query:
         return {"results": []}
 
     try:
-        mgr = _get_memory_manager()
         if layer:
-            results = await mgr.retrieve_by_layer(project_id, q, layer, n_results=10)
+            results = await memory_manager.retrieve_by_layer(project_id, query, layer, n_results=10)
         else:
-            results = await mgr.retrieve_context(project_id, q, n_results=10)
+            results = await memory_manager.retrieve_context(project_id, query, n_results=10)
 
         formatted = []
         if results and results.get("documents"):
@@ -112,8 +99,7 @@ async def get_chapter_analysis(project_id: str, chapter_id: str, db: AsyncSessio
 async def clear_memories(project_id: str):
     """Delete all memories for a project."""
     try:
-        mgr = _get_memory_manager()
-        await mgr.delete_project_memories(project_id)
+        await memory_manager.delete_project_memories(project_id)
         return {"deleted": True}
     except Exception as e:
         logger.exception("Failed to clear memories for %s", project_id)

@@ -3,13 +3,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
-from app.models.settings_model import SettingsModel, APIPreset
+from app.models.user_config import SettingsModel, APIPreset
 from app.services.ai_service import AIService
 from app.config import settings as app_settings
-from app.logger import get_logger
 
 router = APIRouter(prefix="/settings", tags=["settings"])
-logger = get_logger(__name__)
 
 
 async def _get_or_create_settings(db: AsyncSession) -> SettingsModel:
@@ -29,7 +27,7 @@ async def get_settings(db: AsyncSession = Depends(get_db)):
     settings = await _get_or_create_settings(db)
     return {
         "ai_provider": settings.ai_provider,
-        "ai_model": settings.ai_model,
+        "ai_model": settings.llm_model,
         "temperature": settings.temperature,
         "max_tokens": settings.max_tokens,
         "theme": settings.theme,
@@ -45,13 +43,23 @@ async def get_settings(db: AsyncSession = Depends(get_db)):
 async def save_settings(data: dict, db: AsyncSession = Depends(get_db)):
     """Update global settings."""
     settings = await _get_or_create_settings(db)
-    updatable = ("ai_provider", "ai_model", "temperature", "max_tokens", "theme", "active_preset_id", "analysis_preset_id")
-    for key in updatable:
-        if key in data:
-            setattr(settings, key, data[key])
-    if "api_key" in data and data["api_key"]:
+    if "ai_provider" in data:
+        settings.ai_provider = data["ai_provider"]
+    if "ai_model" in data:
+        settings.llm_model = data["ai_model"]
+    elif "llm_model" in data:
+        settings.llm_model = data["llm_model"]
+    if "temperature" in data:
+        settings.temperature = data["temperature"]
+    if "max_tokens" in data:
+        settings.max_tokens = data["max_tokens"]
+    if "ai_api_key" in data and data["ai_api_key"]:
+        settings.ai_api_key = data["ai_api_key"]
+    elif "api_key" in data and data["api_key"]:
         settings.ai_api_key = data["api_key"]
-    if "base_url" in data:
+    if "ai_base_url" in data:
+        settings.ai_base_url = data["ai_base_url"]
+    elif "base_url" in data:
         settings.ai_base_url = data["base_url"]
     await db.commit()
     return {"saved": True}
@@ -73,10 +81,10 @@ async def test_api_connection(data: dict):
     """Test AI API connectivity with preview response."""
     try:
         service = AIService(
-            provider=data.get("provider", "openai"),
-            api_key=data.get("api_key"),
-            base_url=data.get("base_url"),
-            model=data.get("model", "gpt-4o"),
+            provider=data.get("ai_provider", data.get("provider", app_settings.default_llm_provider)),
+            api_key=data.get("ai_api_key", data.get("api_key")),
+            base_url=data.get("ai_base_url", data.get("base_url")),
+            model=data.get("ai_model", data.get("model", app_settings.default_llm_model)),
         )
         # Test basic connectivity
         response = await service.generate(
@@ -108,7 +116,7 @@ async def list_presets(db: AsyncSession = Depends(get_db)):
     presets = result.scalars().all()
     return {
         "items": [{
-            "id": p.id, "name": p.name, "provider": p.provider, "model": p.model,
+            "id": p.id, "name": p.name, "provider": p.provider, "model": p.llm_model,
             "api_key_set": bool(p.api_key), "base_url": p.base_url,
             "temperature": p.temperature, "max_tokens": p.max_tokens,
             "is_active": p.id == settings.active_preset_id,
@@ -120,14 +128,15 @@ async def list_presets(db: AsyncSession = Depends(get_db)):
 @router.post("/presets")
 async def create_preset(data: dict, db: AsyncSession = Depends(get_db)):
     """Create a new API configuration preset."""
+    cfg = data.get("config", data)  # frontend sends {name, config: {...}}
     preset = APIPreset(
         name=data.get("name", "新预设"),
-        provider=data.get("provider", "openai"),
-        model=data.get("model", "gpt-4o"),
-        api_key=data.get("api_key"),
-        base_url=data.get("base_url"),
-        temperature=data.get("temperature", 0.7),
-        max_tokens=data.get("max_tokens", 32000),
+        provider=cfg.get("ai_provider", cfg.get("provider", app_settings.default_llm_provider)),
+        llm_model=cfg.get("ai_model", cfg.get("model", app_settings.default_llm_model)),
+        api_key=cfg.get("ai_api_key", cfg.get("api_key")),
+        base_url=cfg.get("ai_base_url", cfg.get("base_url")),
+        temperature=cfg.get("temperature", 0.7),
+        max_tokens=cfg.get("max_tokens", 32000),
     )
     db.add(preset)
     await db.commit()
@@ -150,7 +159,7 @@ async def activate_preset(preset_id: str, data: dict, db: AsyncSession = Depends
     preset = result.scalar_one_or_none()
     if preset:
         settings.ai_provider = preset.provider
-        settings.ai_model = preset.model
+        settings.llm_model = preset.llm_model
         settings.temperature = preset.temperature
         settings.max_tokens = preset.max_tokens
         if preset.api_key:

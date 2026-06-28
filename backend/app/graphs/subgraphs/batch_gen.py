@@ -8,17 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _get_ai_service(state: NovelState, **overrides):
-    config = state.get("generation_config", {})
-    return create_ai_service(
-        provider=overrides.pop("provider", config.get("provider", "openai")),
-        api_key=overrides.pop("api_key", config.get("api_key", None)),
-        base_url=overrides.pop("base_url", config.get("base_url", None)),
-        model=overrides.pop("model", config.get("model", settings.default_ai_model)),
-        temperature=overrides.pop("temperature", config.get("temperature", 0.7)),
-        max_tokens=overrides.pop("max_tokens", config.get("max_tokens", 32000)),
-        **overrides,
-    )
+from app.graphs.utils import get_ai_service as _get_ai_service
 
 
 async def prepare_batch_context(state: NovelState) -> dict:
@@ -77,7 +67,7 @@ async def generate_chapters_parallel(state: NovelState) -> dict:
         try:
             result = await ai.generate("你是一位专业小说作家。", prompt)
             new_chapter = {
-                "index": i,
+                "chapter_index": i,
                 "title": outline.get("title", f"第{i+1}章"),
                 "content": result.strip(),
                 "word_count": len(result),
@@ -89,7 +79,7 @@ async def generate_chapters_parallel(state: NovelState) -> dict:
             else:
                 # Extend chapters list
                 while len(chapters) < i:
-                    chapters.append({"index": len(chapters), "title": "", "content": "", "status": "pending"})
+                    chapters.append({"chapter_index": len(chapters), "title": "", "content": "", "status": "pending"})
                 chapters.append(new_chapter)
 
             generated_count += 1
@@ -113,28 +103,17 @@ async def generate_chapters_parallel(state: NovelState) -> dict:
 
 
 async def batch_analyze(state: NovelState) -> dict:
-    """Batch analyze all newly generated chapters."""
+    """Mark batch chapters as pending analysis.
+
+    Full analysis (plot extraction, foreshadows, quality scoring, etc.) is
+    performed by the chapter_analyze subgraph during the normal chapter flow.
+    This node serves as a lightweight phase marker for batch generation.
+    """
     batch_start = state.get("_batch_start", 0)
     batch_end = state.get("_batch_end", 0)
-    chapters = state.get("chapters", [])
-    plot_memory = state.get("plot_memory", [])
-
-    # Generate summaries for batch chapters and add to plot_memory
-    for i in range(batch_start, min(batch_end, len(chapters))):
-        chapter = chapters[i]
-        content = chapter.get("content", "")
-        if content and len(content) > 100:
-            # Simple keyword extraction for summary
-            summary = content[:200] + "..."
-            plot_memory.append({
-                "chapter_index": i,
-                "summary": summary,
-            })
-
-    return {
-        "plot_memory": plot_memory,
-        "current_phase": "batch_analyzed",
-    }
+    chapters_count = min(batch_end, len(state.get("chapters", []))) - batch_start
+    logger.info("Batch analysis phase: %d chapters pending full analysis", max(chapters_count, 0))
+    return {"current_phase": "batch_analyzed"}
 
 
 async def update_progress(state: NovelState) -> dict:
@@ -166,11 +145,22 @@ async def handle_pause_resume(state: NovelState) -> dict:
             "human_feedback": None}
 
 
+def _should_continue_batch(state: NovelState) -> str:
+    """Check if batch generation should continue or abort."""
+    batch_tasks = state.get("background_tasks", [])
+    for task in batch_tasks:
+        if task.get("type") == "batch_generate":
+            if task.get("status") in ("paused", "cancelled"):
+                return "abort"
+    return "continue"
+
+
 def create_batch_gen_subgraph():
     """Create the Batch Generation subgraph.
 
-    Flow: prepare_context → generate_parallel → batch_analyze → update_progress
-    With pause/resume checking between steps.
+    Flow: prepare_context → handle_pause_resume →
+          (continue) generate_parallel → batch_analyze → update_progress → END
+          (abort)   update_progress → END
     """
     builder = StateGraph(NovelState)
 
@@ -181,7 +171,12 @@ def create_batch_gen_subgraph():
     builder.add_node("handle_pause_resume", handle_pause_resume)
 
     builder.set_entry_point("prepare_batch_context")
-    builder.add_edge("prepare_batch_context", "generate_chapters_parallel")
+    builder.add_edge("prepare_batch_context", "handle_pause_resume")
+    builder.add_conditional_edges(
+        "handle_pause_resume",
+        _should_continue_batch,
+        {"continue": "generate_chapters_parallel", "abort": "update_progress"},
+    )
     builder.add_edge("generate_chapters_parallel", "batch_analyze")
     builder.add_edge("batch_analyze", "update_progress")
     builder.add_edge("update_progress", END)

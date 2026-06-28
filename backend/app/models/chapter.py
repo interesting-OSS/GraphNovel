@@ -17,7 +17,7 @@ class Chapter(Base):
     word_count: Mapped[int] = mapped_column(Integer, default=0)
     chapter_index: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(50), default="draft")  # draft/polished/final
-    writing_style_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    writing_style_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("writing_styles.id", ondelete="SET NULL"), nullable=True)
     model_override: Mapped[str | None] = mapped_column(String(100), nullable=True)
     skill_override: Mapped[str | None] = mapped_column(String(100), nullable=True)
     narrative_perspective_override: Mapped[str | None] = mapped_column(String(50), nullable=True)

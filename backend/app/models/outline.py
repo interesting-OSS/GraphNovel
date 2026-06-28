@@ -12,13 +12,14 @@ class Outline(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     volume: Mapped[int] = mapped_column(Integer, default=1)
-    chapter_num: Mapped[int] = mapped_column(Integer, default=1)
+    chapter_index: Mapped[int] = mapped_column("chapter_num", Integer, default=1)
     title: Mapped[str] = mapped_column(String(500), default="")
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     key_points: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list
     mode: Mapped[str] = mapped_column(String(50), default="one-to-one")  # one-to-one / one-to-many
     expansion_strategy: Mapped[str] = mapped_column(String(50), default="balanced")  # balanced/climax/detail
     expansion_plan: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
+    target_words: Mapped[int] = mapped_column(Integer, default=3000)
     parent_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("outlines.id", ondelete="SET NULL"), nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

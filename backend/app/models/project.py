@@ -1,7 +1,7 @@
 """Project model."""
 import uuid
 from datetime import datetime
-from sqlalchemy import String, Integer, Text, DateTime, func
+from sqlalchemy import String, Integer, Text, DateTime, ForeignKey, func
 from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
 
@@ -21,8 +21,8 @@ class Project(Base):
     world_setting: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON string
     cover_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     cover_url: Mapped[str | None] = mapped_column(String(2000), nullable=True)
-    writing_style_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    prompt_template_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    writing_style_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("writing_styles.id", ondelete="SET NULL"), nullable=True)
+    prompt_template_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("prompt_templates.id", ondelete="SET NULL"), nullable=True)
     active_skill: Mapped[str | None] = mapped_column(String(100), nullable=True)
     generation_config: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON: {provider, model, api_key, ...}
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

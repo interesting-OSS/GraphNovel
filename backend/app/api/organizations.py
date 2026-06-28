@@ -1,11 +1,12 @@
-"""Organization API routes — CRUD + members + AI generation."""
+"""Organization API routes — CRUD + members + AI generation via graph."""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from app.database import get_db
 from app.models.relationship import Organization, OrganizationMember
-from app.services.ai_service import create_ai_service
+from app.graphs.state import NovelState
 from app.config import settings
+from app.graphs.utils import get_gen_config
 from app.logger import get_logger
 import json
 
@@ -21,6 +22,7 @@ async def list_organizations(project_id: str, db: AsyncSession = Depends(get_db)
         "items": [{
             "id": o.id, "name": o.name, "org_type": o.org_type,
             "leader_id": o.leader_id, "goal": o.goal, "description": o.description,
+            "alignment": o.alignment,
             "hierarchy": json.loads(o.hierarchy) if o.hierarchy else None,
         } for o in orgs],
         "total": len(orgs),
@@ -43,6 +45,7 @@ async def get_organization(org_id: str, db: AsyncSession = Depends(get_db)):
         "id": org.id, "project_id": org.project_id, "name": org.name,
         "org_type": org.org_type, "leader_id": org.leader_id,
         "goal": org.goal, "description": org.description,
+        "alignment": org.alignment,
         "hierarchy": json.loads(org.hierarchy) if org.hierarchy else None,
         "members": [{"id": m.id, "character_id": m.character_id, "role": m.role} for m in members],
     }
@@ -57,6 +60,7 @@ async def create_organization(data: dict, db: AsyncSession = Depends(get_db)):
         leader_id=data.get("leader_id"),
         goal=data.get("goal", ""),
         description=data.get("description", ""),
+        alignment=data.get("alignment", "中立"),
         hierarchy=json.dumps(data.get("hierarchy"), ensure_ascii=False) if data.get("hierarchy") else None,
     )
     db.add(org)
@@ -71,7 +75,7 @@ async def update_organization(org_id: str, data: dict, db: AsyncSession = Depend
     org = result.scalar_one_or_none()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
-    for key in ("name", "org_type", "leader_id", "goal", "description"):
+    for key in ("name", "org_type", "leader_id", "goal", "description", "alignment"):
         if key in data:
             setattr(org, key, data[key])
     if "hierarchy" in data and isinstance(data["hierarchy"], (list, dict)):
@@ -86,12 +90,10 @@ async def delete_organization(org_id: str, db: AsyncSession = Depends(get_db)):
     org = result.scalar_one_or_none()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
-    # Delete members first
-    members_result = await db.execute(
-        select(OrganizationMember).where(OrganizationMember.organization_id == org_id)
+    # Delete members in bulk (single query, no N+1)
+    await db.execute(
+        delete(OrganizationMember).where(OrganizationMember.organization_id == org_id)
     )
-    for m in members_result.scalars().all():
-        await db.delete(m)
     await db.delete(org)
     await db.commit()
     return {"deleted": True}
@@ -131,21 +133,19 @@ async def remove_member(org_id: str, character_id: str, db: AsyncSession = Depen
 
 @router.post("/generate")
 async def generate_organization(data: dict):
-    ai = create_ai_service(
-        provider=data.get("provider", "openai"),
-        api_key=data.get("api_key"),
-        model=data.get("model", settings.default_ai_model),
-        temperature=0.7, max_tokens=8000,
-    )
-    prompt = f"""小说类型：{data.get('genre', '玄幻')}
-世界观：{data.get('world_context', '未设定')}
+    """Generate organizations via the graph's organization_node."""
+    from app.graphs.main_graph import organization_node
 
-请设计一个组织/势力。以JSON格式输出：
-{{"name": "组织名", "org_type": "门派/势力/组织/家族", "goal": "目标(30-80字)", "description": "描述(50-150字)", "hierarchy": ["层级1", "层级2"], "alignment": "正义/中立/邪恶"}}
-只输出JSON。"""
+    state = NovelState(
+        project_id=data.get("project_id", ""),
+        genre=data.get("genre", "玄幻"),
+        world_setting=data.get("world_setting", {}),
+        generation_config=get_gen_config(data, max_tokens=8000),
+    )
+
     try:
-        result = await ai.generate_json("你是一位世界观设计师。只输出JSON。", prompt)
-        return {"status": "completed", "organization": result}
+        result = await organization_node(state)
+        return {"status": "completed", "organizations": result.get("organizations", [])}
     except Exception as e:
         logger.error("Organization generation failed: %s", e)
         return {"status": "failed", "error": str(e)}

@@ -12,35 +12,25 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _get_ai_service(state: NovelState, **overrides):
-    config = state.get("generation_config", {})
-    return create_ai_service(
-        provider=overrides.pop("provider", config.get("provider", "openai")),
-        api_key=overrides.pop("api_key", config.get("api_key", None)),
-        base_url=overrides.pop("base_url", config.get("base_url", None)),
-        model=overrides.pop("model", config.get("model", settings.default_ai_model)),
-        temperature=overrides.pop("temperature", config.get("temperature", 0.5)),
-        max_tokens=overrides.pop("max_tokens", config.get("max_tokens", 8000)),
-        **overrides,
-    )
+from app.graphs.utils import get_ai_service as _get_ai_service
 
 
 def _get_chapter_content(state: NovelState) -> str:
     chapters = state.get("chapters", [])
-    idx = state.get("current_chapter_index", 0)
-    if 0 <= idx < len(chapters):
-        return chapters[idx].get("content", "")
+    chapter_index = state.get("current_chapter_index", 0)
+    if 0 <= chapter_index < len(chapters):
+        return chapters[chapter_index].get("content", "")
     return ""
 
 
 async def reader_review(state: NovelState) -> dict:
     """Review from reader perspective."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.5, max_tokens=8000)
     content = _get_chapter_content(state)
     if not content:
         return {"current_phase": "reader_reviewed"}
 
-    agent = ReviewerAgent(model=ai._get_model())
+    agent = ReviewerAgent(model=ai.model)
     prompt = agent.build_review_prompt(chapter_content=content[:10000])
     try:
         result = await ai.generate(agent.system_prompt, prompt)
@@ -54,7 +44,7 @@ async def reader_review(state: NovelState) -> dict:
 
 async def logic_check(state: NovelState) -> dict:
     """Check plot logic consistency."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.5, max_tokens=8000)
     content = _get_chapter_content(state)
     if not content:
         return {"current_phase": "logic_checked"}
@@ -66,7 +56,7 @@ async def logic_check(state: NovelState) -> dict:
     analyses = state.get("chapter_analyses", [])
     prev_events = analyses[-1].get("summary", "无") if analyses else "无"
 
-    agent = LogicAgent(model=ai._get_model())
+    agent = LogicAgent(model=ai.model)
     prompt = agent.build_check_prompt(
         chapter_content=content[:10000],
         world_setting=world_str,
@@ -85,12 +75,12 @@ async def logic_check(state: NovelState) -> dict:
 
 async def prose_check(state: NovelState) -> dict:
     """Check prose quality."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.5, max_tokens=8000)
     content = _get_chapter_content(state)
     if not content:
         return {"current_phase": "prose_checked"}
 
-    agent = ProseAgent(model=ai._get_model())
+    agent = ProseAgent(model=ai.model)
     prompt = agent.build_check_prompt(chapter_content=content[:10000])
     try:
         result = await ai.generate(agent.system_prompt, prompt)
@@ -104,17 +94,17 @@ async def prose_check(state: NovelState) -> dict:
 
 async def pacing_check(state: NovelState) -> dict:
     """Analyze pacing."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.5, max_tokens=8000)
     content = _get_chapter_content(state)
     if not content:
         return {"current_phase": "pacing_checked"}
 
     outlines = state.get("outlines", [])
-    idx = state.get("current_chapter_index", 0)
-    agent = PacingAgent(model=ai._get_model())
+    chapter_index = state.get("current_chapter_index", 0)
+    agent = PacingAgent(model=ai.model)
     prompt = agent.build_check_prompt(
         chapter_content=content[:10000],
-        chapter_index=idx + 1,
+        chapter_index=chapter_index + 1,
         total_chapters=len(outlines),
         story_phase="发展阶段",
     )
@@ -131,9 +121,9 @@ async def pacing_check(state: NovelState) -> dict:
 async def aggregate_reviews(state: NovelState) -> dict:
     """Aggregate all four review dimensions into a unified review report."""
     reviews = state.get("_review_results", {})
-    idx = state.get("current_chapter_index", 0)
+    chapter_index = state.get("current_chapter_index", 0)
 
-    report = f"""# 第{idx + 1}章 多Agent审稿报告
+    report = f"""# 第{chapter_index + 1}章 多Agent审稿报告
 
 ## 📖 读者视角
 {reviews.get("reader_review", "无读者审阅")}
@@ -149,7 +139,7 @@ async def aggregate_reviews(state: NovelState) -> dict:
 """
     chapter_analyses = state.get("chapter_analyses", [])
     for a in chapter_analyses:
-        if a.get("chapter_index") == idx:
+        if a.get("chapter_index") == chapter_index:
             a["review_report"] = report
             break
 

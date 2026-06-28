@@ -1,13 +1,14 @@
-"""Inspiration Generation API — AI-powered creative idea generation."""
+"""Inspiration Generation API — AI-powered creative idea generation via graph."""
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
 from app.models.inspiration import Inspiration
-from app.services.ai_service import create_ai_service
+from app.graphs.state import NovelState
 from app.utils.sse_response import SSEResponse
 from app.config import settings
+from app.graphs.utils import get_gen_config
 from app.logger import get_logger
 import uuid
 import asyncio
@@ -16,32 +17,30 @@ router = APIRouter(prefix="/inspiration", tags=["inspiration"])
 logger = get_logger(__name__)
 
 
+def _build_insp_state(data: dict) -> NovelState:
+    """Build a minimal NovelState for inspiration generation."""
+    return NovelState(
+        project_id=data.get("project_id", ""),
+        title=data.get("title", ""),
+        genre=data.get("genre", data.get("genre_tags", "玄幻")),
+        description=data.get("context", data.get("description", "")),
+        world_setting=data.get("world_setting", {}),
+        characters=data.get("characters", []),
+        human_feedback=data.get("feedback", ""),
+        generation_config=get_gen_config(data, temperature=0.9, max_tokens=8000),
+    )
+
+
 @router.post("/generate")
 async def generate_inspiration(data: dict):
-    """Generate creative inspiration ideas via AI."""
-    ai = create_ai_service(
-        provider=data.get("provider", "openai"),
-        api_key=data.get("api_key"),
-        model=data.get("model", settings.default_ai_model),
-        temperature=0.9, max_tokens=8000,
-    )
-    prompt = f"""你是一位创意写作顾问。请为以下需求生成3-5个创意灵感：
+    """Generate creative inspiration ideas via graph's generate_options node."""
+    from app.graphs.subgraphs.inspiration import generate_options
 
-类型偏好：{data.get('genre_tags', '任意')}
-上下文：{data.get('context', '无')}
-反馈方向：{data.get('feedback', '')}
-
-以JSON数组格式输出：
-[{{"idea": "创意描述(50-200字)", "type": "情节转折/角色发展/世界观扩展/冲突设计/悬念设置", "genre_tags": ["标签"], "impact": "high/medium/low", "implementation": "实现建议"}}]
-只输出JSON数组。"""
-
+    state = _build_insp_state(data)
     try:
-        result = await ai.generate_json("你是一位富有创造力的写作顾问。只输出JSON数组。", prompt)
-        if isinstance(result, dict):
-            result = [result]
-        for insp in result:
-            insp.setdefault("id", str(uuid.uuid4()))
-        return {"ideas": result}
+        result = await generate_options(state)
+        inspirations = result.get("inspirations", [])
+        return {"ideas": inspirations}
     except Exception as e:
         logger.error("Inspiration generation failed: %s", e)
         return {"ideas": [], "error": str(e)}
@@ -49,31 +48,18 @@ async def generate_inspiration(data: dict):
 
 @router.post("/generate-stream")
 async def generate_inspiration_stream(data: dict):
-    """Generate inspiration with SSE streaming."""
+    """Generate inspiration with SSE streaming via graph node."""
     async def event_generator():
         try:
-            ai = create_ai_service(
-                provider=data.get("provider", "openai"),
-                api_key=data.get("api_key"),
-                model=data.get("model", settings.default_ai_model),
-                temperature=0.9, max_tokens=8000,
-            )
+            from app.graphs.subgraphs.inspiration import generate_options
+
             yield SSEResponse.progress("正在生成创意灵感...", 20.0, "generating")
 
-            prompt = f"""类型偏好：{data.get('genre_tags', '任意')}
-上下文：{data.get('context', '无')}
+            state = _build_insp_state(data)
+            result = await generate_options(state)
+            inspirations = result.get("inspirations", [])
 
-请生成3-5个创意灵感点子，用JSON数组输出：
-[{{"idea": "...", "type": "...", "genre_tags": [...], "impact": "...", "implementation": "..."}}]
-只输出JSON数组。"""
-
-            result = await ai.generate_json("你是一位创意写作顾问。只输出JSON数组。", prompt)
-            if isinstance(result, dict):
-                result = [result]
-            for insp in result:
-                insp.setdefault("id", str(uuid.uuid4()))
-
-            yield SSEResponse.result({"ideas": result})
+            yield SSEResponse.result({"ideas": inspirations})
             yield SSEResponse.done("灵感生成完成")
         except Exception as e:
             logger.error("Inspiration stream failed: %s", e)
@@ -88,23 +74,17 @@ async def generate_inspiration_stream(data: dict):
 
 @router.post("/refine")
 async def refine_inspiration(data: dict):
-    """Refine an existing inspiration based on feedback."""
-    ai = create_ai_service(
-        provider=data.get("provider", "openai"),
-        api_key=data.get("api_key"),
-        model=data.get("model", settings.default_ai_model),
-        temperature=0.9, max_tokens=4000,
-    )
-    prompt = f"""原始灵感：{data.get('original_idea', '')}
-用户反馈：{data.get('feedback', '请改进')}
+    """Refine an existing inspiration based on feedback via graph node."""
+    from app.graphs.subgraphs.inspiration import refine_iteration
 
-请根据反馈改进这个创意灵感，以JSON格式输出：
-{{"idea": "改进后的创意描述", "type": "...", "genre_tags": [...], "impact": "...", "implementation": "..."}}
-只输出JSON。"""
+    state = _build_insp_state(data)
+    state["human_feedback"] = f"原始灵感：{data.get('original_idea', '')}\n用户反馈：{data.get('feedback', '请改进')}"
 
     try:
-        result = await ai.generate_json("你是一位创意写作顾问。只输出JSON。", prompt)
-        return {"refined": True, "idea": result}
+        result = await refine_iteration(state)
+        inspirations = result.get("inspirations", [])
+        latest = inspirations[-1] if inspirations else {}
+        return {"refined": True, "idea": latest}
     except Exception as e:
         logger.error("Refine inspiration failed: %s", e)
         return {"refined": False, "error": str(e)}
@@ -112,17 +92,19 @@ async def refine_inspiration(data: dict):
 
 @router.post("/quick-generate")
 async def quick_generate(data: dict):
-    """Quick single inspiration generation."""
-    ai = create_ai_service(
-        provider=data.get("provider", "openai"),
-        api_key=data.get("api_key"),
-        model=data.get("model", settings.default_ai_model),
-        temperature=0.9, max_tokens=2000,
-    )
-    prompt = f"""请用一句话（50-100字）生成一个关于"{data.get('genre_tags', '小说')}"的创意点子。只输出纯文本。"""
+    """Quick single inspiration generation via graph node."""
+    from app.graphs.subgraphs.inspiration import generate_options
+
+    state = _build_insp_state(data)
+    # Limit to a single quick idea
+    state["generation_config"]["max_tokens"] = 2000
+    state["human_feedback"] = "请只用一句话（50-100字）"
+
     try:
-        result = await ai.generate("你是一位创意作家。", prompt)
-        return {"idea": result.strip()}
+        result = await generate_options(state)
+        inspirations = result.get("inspirations", [])
+        first = inspirations[0].get("idea", "") if inspirations else ""
+        return {"idea": first}
     except Exception as e:
         return {"idea": "", "error": str(e)}
 

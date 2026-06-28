@@ -8,38 +8,55 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _get_ai_service(state: NovelState, **overrides):
-    config = state.get("generation_config", {})
-    return create_ai_service(
-        provider=overrides.pop("provider", config.get("provider", "openai")),
-        api_key=overrides.pop("api_key", config.get("api_key", None)),
-        base_url=overrides.pop("base_url", config.get("base_url", None)),
-        model=overrides.pop("model", config.get("model", settings.default_ai_model)),
-        temperature=overrides.pop("temperature", config.get("temperature", 0.3)),
-        max_tokens=overrides.pop("max_tokens", config.get("max_tokens", 8000)),
-        **overrides,
-    )
+from app.graphs.utils import get_ai_service as _get_ai_service
 
 
 async def sync_from_analysis(state: NovelState) -> dict:
-    """Sync foreshadow status from chapter analysis results."""
+    """Sync foreshadow status from chapter analysis results.
+
+    Resolution is primarily handled by extract_foreshadows in chapter_analyze.
+    This node cross-checks foreshadows against resolved_foreshadows in all
+    chapter analyses to catch any missed resolutions.
+    """
     chapter_analyses = state.get("chapter_analyses", [])
     foreshadows = state.get("foreshadows", [])
 
-    # Track which foreshadows were resolved in recent chapters
+    # Collect resolved descriptions from all chapter analyses
+    resolved_descs = set()
     for analysis in chapter_analyses:
-        for hook in analysis.get("hooks", []):
-            desc = hook.get("description", "")
-            for f in foreshadows:
-                if desc and desc[:30] in f.get("description", ""):
+        for fs in analysis.get("resolved_foreshadows", []):
+            if isinstance(fs, str):
+                resolved_descs.add(fs)
+            elif isinstance(fs, dict):
+                resolved_descs.add(fs.get("description", ""))
+
+    # Match by ID first, then by description substring (min 10 chars)
+    for f in foreshadows:
+        if f.get("status") == "resolved":
+            continue
+        fid = f.get("id", "")
+        for analysis in chapter_analyses:
+            resolved_list = analysis.get("resolved_foreshadows", [])
+            for item in resolved_list:
+                if isinstance(item, dict) and item.get("id") == fid:
                     f["status"] = "resolved"
+                    break
+            if f.get("status") == "resolved":
+                break
+        # Fallback: description matching (require at least 10 chars overlap)
+        if f.get("status") != "resolved":
+            fdesc = f.get("description", "")
+            for desc in resolved_descs:
+                if len(desc) >= 10 and desc[:40] in fdesc:
+                    f["status"] = "resolved"
+                    break
 
     return {"foreshadows": foreshadows, "current_phase": "foreshadows_synced"}
 
 
 async def classify_foreshadow(state: NovelState) -> dict:
     """Classify foreshadows by category using AI."""
-    ai = _get_ai_service(state)
+    ai = _get_ai_service(state, temperature=0.3, max_tokens=8000)
     foreshadows = state.get("foreshadows", [])
     if not foreshadows:
         return {"current_phase": "foreshadows_classified"}
@@ -91,8 +108,9 @@ async def check_deadlines(state: NovelState) -> dict:
                     "chapters_left": chapters_left,
                     "warning": f"伏笔应在第{target}章前揭示，还剩{chapters_left}章",
                 })
-        # Also update resolved status
-        if f.get("status") == "set" and f.get("set_chapter", 0) < current_idx - 10:
+        # Also update resolved status (set_chapter > 0 guard prevents false overdue on default=0)
+        set_ch = f.get("set_chapter", 0)
+        if f.get("status") == "set" and set_ch > 0 and set_ch < current_idx - 10:
             f["status"] = "overdue"
 
     return {"foreshadows": foreshadows, "current_phase": "deadlines_checked",

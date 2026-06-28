@@ -44,7 +44,7 @@ from app.models.mcp_plugin import MCPPlugin                               # noqa
 from app.models.prompt_template import PromptTemplate                     # noqa: E402,F401
 from app.models.background_task import BackgroundTask                     # noqa: E402,F401
 from app.models.inspiration import Inspiration                            # noqa: E402,F401
-from app.models.settings_model import SettingsModel, APIPreset            # noqa: E402,F401
+from app.models.user_config import SettingsModel, APIPreset                  # noqa: E402,F401
 
 # ---------------------------------------------------------------------------
 # 3. Alembic 配置

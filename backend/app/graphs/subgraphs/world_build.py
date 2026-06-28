@@ -2,9 +2,7 @@
 from typing import Literal
 from langgraph.graph import StateGraph, END
 from app.graphs.state import NovelState
-from app.services.ai_service import create_ai_service
-from app.agents.base_agent import BaseAgent
-from app.config import settings
+from app.graphs.utils import get_ai_service as _get_ai_service
 import json
 import logging
 
@@ -158,6 +156,9 @@ async def generate_culture(state: NovelState) -> dict:
         return {"current_phase": "culture_generated", "error": str(e)}
 
 
+MAX_FIX_ATTEMPTS = 3
+
+
 async def check_consistency(state: NovelState) -> dict:
     """Check the world setting for internal contradictions using AI."""
     ai = _get_ai_service(state)
@@ -166,9 +167,12 @@ async def check_consistency(state: NovelState) -> dict:
     if not world:
         return {"current_phase": "consistency_checked"}
 
+    # Don't include internal bookkeeping fields in the check prompt
+    checkable = {k: v for k, v in world.items() if not k.startswith("_")}
+
     prompt = f"""请检查以下世界观设定是否存在内部矛盾或不一致之处：
 
-{json.dumps(world, ensure_ascii=False, indent=2)}
+{json.dumps(checkable, ensure_ascii=False, indent=2)}
 
 请以JSON格式输出：
 ```json
@@ -186,32 +190,124 @@ async def check_consistency(state: NovelState) -> dict:
             max_retries=3,
         )
         world["consistency_check"] = result
+
+        # Sync to DB if no conflicts (subgraph exits on "done")
+        if not result.get("has_conflicts"):
+            project_id = state.get("project_id", "")
+            if project_id:
+                from app.graphs.graph_db_sync import sync_world_setting
+                await sync_world_setting(project_id, {
+                    k: v for k, v in world.items() if not k.startswith("_")
+                })
+
         return {"world_setting": world, "current_phase": "consistency_checked"}
     except Exception as e:
         logger.error("consistency check failed: %s", e)
         return {"current_phase": "consistency_checked", "error": str(e)}
 
 
-def route_after_check(state: NovelState) -> Literal["human_review", "done"]:
-    """Route based on whether the world setting passes consistency checks."""
+def route_after_check(state: NovelState) -> Literal["resolve_conflicts", "done"]:
+    """Route to resolve_conflicts if inconsistencies found and retries remain."""
     world = state.get("world_setting", {})
-    if world.get("consistency_check", {}).get("has_conflicts"):
-        return "human_review"
+    has_conflicts = world.get("consistency_check", {}).get("has_conflicts", False)
+    attempts = world.get("_fix_attempts", 0)
+
+    if has_conflicts and attempts < MAX_FIX_ATTEMPTS:
+        return "resolve_conflicts"
     return "done"
 
 
-def _get_ai_service(state: NovelState, **overrides):
-    """Get an AI service instance from state generation config."""
-    config = state.get("generation_config", {})
-    return create_ai_service(
-        provider=overrides.pop("provider", config.get("provider", "openai")),
-        api_key=overrides.pop("api_key", config.get("api_key", None)),
-        base_url=overrides.pop("base_url", config.get("base_url", None)),
-        model=overrides.pop("model", config.get("model", settings.default_ai_model)),
-        temperature=overrides.pop("temperature", config.get("temperature", 0.7)),
-        max_tokens=overrides.pop("max_tokens", config.get("max_tokens", 32000)),
-        **overrides,
+async def resolve_conflicts(state: NovelState) -> dict:
+    """Ask the AI to rewrite conflicting parts of the world setting."""
+    ai = _get_ai_service(state)
+    world = state.get("world_setting", {})
+    check = world.get("consistency_check", {})
+    conflicts = check.get("conflicts", [])
+    suggestions = check.get("suggestions", [])
+    attempts = world.get("_fix_attempts", 0)
+
+    logger.info(
+        "Resolving conflicts — attempt %d/%d. Conflicts: %s",
+        attempts + 1, MAX_FIX_ATTEMPTS, conflicts,
     )
+
+    # Build a focused prompt: show the current world setting and the problems
+    checkable = {k: v for k, v in world.items()
+                 if not k.startswith("_") and k != "consistency_check"}
+
+    prompt = f"""当前世界观设定存在以下矛盾，请修改以消除矛盾：
+
+## 当前设定
+{json.dumps(checkable, ensure_ascii=False, indent=2)}
+
+## 发现的矛盾
+{json.dumps(conflicts, ensure_ascii=False, indent=2)}
+
+## 改进建议
+{json.dumps(suggestions, ensure_ascii=False, indent=2)}
+
+请输出修正后的完整世界观设定，以JSON格式输出（只输出需要修改的字段，保留原文中没问题的字段）：
+```json
+{{
+  "time_period": "...",
+  "geography": "...",
+  "power_system": "...",
+  "factions": "...",
+  "culture": "..."
+}}
+```
+
+注意：
+1. 只修改存在矛盾的字段，其他字段保持原样
+2. 修改后各维度之间必须保持内部一致性
+3. 每个字段 300-500 字"""
+
+    try:
+        result = await ai.generate_json(
+            system_prompt="你是一位资深的世界观架构师，擅长修复世界观设定中的逻辑矛盾。",
+            user_prompt=prompt,
+            max_retries=3,
+        )
+
+        # Merge: only overwrite fields the AI actually returned
+        for key in ("time_period", "geography", "power_system", "factions", "culture"):
+            if key in result and result[key]:
+                world[key] = result[key]
+
+        world["_fix_attempts"] = attempts + 1
+        world["_fix_history"] = world.get("_fix_history", []) + [{
+            "attempt": attempts + 1,
+            "conflicts": conflicts,
+            "applied": [k for k in result if k in world and result[k]],
+        }]
+
+        # Sync to DB after final fix attempt
+        if attempts + 1 >= MAX_FIX_ATTEMPTS:
+            project_id = state.get("project_id", "")
+            if project_id:
+                from app.graphs.graph_db_sync import sync_world_setting
+                await sync_world_setting(project_id, {
+                    k: v for k, v in world.items() if not k.startswith("_")
+                })
+
+        return {"world_setting": world, "current_phase": "conflicts_resolved"}
+    except Exception as e:
+        logger.error("resolve_conflicts failed: %s", e)
+        # Give up on fix attempts if resolution fails
+        world["_fix_attempts"] = MAX_FIX_ATTEMPTS
+        # Still sync what we have
+        project_id = state.get("project_id", "")
+        if project_id:
+            from app.graphs.graph_db_sync import sync_world_setting
+            await sync_world_setting(project_id, {
+                k: v for k, v in world.items() if not k.startswith("_")
+            })
+        return {"world_setting": world, "current_phase": "conflicts_resolved", "error": str(e)}
+
+
+def route_after_resolve(state: NovelState) -> Literal["check_consistency"]:
+    """After resolving conflicts, always loop back to re-check."""
+    return "check_consistency"
 
 
 def create_world_build_subgraph():
@@ -219,7 +315,8 @@ def create_world_build_subgraph():
 
     Generates world setting dimensions sequentially:
         time_period → geography → power_system → factions → culture
-        → consistency_check → [human_review if conflicts, else done]
+        → consistency_check → [resolve_conflicts → re-check, or done]
+        (AI auto-fixes conflicts up to 3 rounds, then exits)
     """
     builder = StateGraph(NovelState)
 
@@ -229,6 +326,7 @@ def create_world_build_subgraph():
     builder.add_node("generate_factions", generate_factions)
     builder.add_node("generate_culture", generate_culture)
     builder.add_node("check_consistency", check_consistency)
+    builder.add_node("resolve_conflicts", resolve_conflicts)
 
     builder.set_entry_point("generate_time_period")
     builder.add_edge("generate_time_period", "generate_geography")
@@ -237,10 +335,18 @@ def create_world_build_subgraph():
     builder.add_edge("generate_factions", "generate_culture")
     builder.add_edge("generate_culture", "check_consistency")
 
+    # check_consistency → resolve_conflicts (loop) or done (exit)
     builder.add_conditional_edges(
         "check_consistency",
         route_after_check,
-        {"human_review": END, "done": END}
+        {"resolve_conflicts": "resolve_conflicts", "done": END}
+    )
+
+    # resolve_conflicts → back to check_consistency for re-verification
+    builder.add_conditional_edges(
+        "resolve_conflicts",
+        route_after_resolve,
+        {"check_consistency": "check_consistency"}
     )
 
     return builder.compile()
